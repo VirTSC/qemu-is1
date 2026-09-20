@@ -30,6 +30,11 @@ struct PCII440FXState {
     PAMMemoryRegion pam_regions[PAM_REGIONS_COUNT];
     MemoryRegion smram_region;
     MemoryRegion smram, low_smram;
+
+    /* AGP: off by default, see the comment in i440fx.c */
+    bool agp;
+    uint64_t agp_aperture_size;
+    MemoryRegion agp_aperture;
 };
 
 #define TYPE_IGD_PASSTHROUGH_I440FX_PCI_DEVICE "igd-passthrough-i440FX"

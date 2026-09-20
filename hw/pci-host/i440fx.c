@@ -36,6 +36,7 @@
 #include "qapi/visitor.h"
 #include "qemu/error-report.h"
 #include "qom/object.h"
+#include "trace.h"
 
 /*
  * I440FX chipset data sheet.
@@ -72,12 +73,128 @@ struct I440FXState {
  */
 #define I440FX_COREBOOT_RAM_SIZE 0x57
 
+/*
+ * AGP.
+ *
+ * The real 440FX has no AGP; this is a 440BX-shaped aperture bolted onto
+ * it, enabled only with -global i440FX.agp=on, so the default pc machine's
+ * config space and migration stream are untouched. It exists for guests whose AGP
+ * driver will not hand out /dev/agpgart unless the host bridge advertises a
+ * genuine aperture: FreeBSD 4.x's agp_intel probe tests class 06, subclass 00,
+ * an AGP capability in the capability list, and then the device ID. The
+ * device ID test has an "Intel Generic" fallback that accepts any Intel
+ * vendor ID, so 8086:1237 matches as soon as the capability is there and the
+ * ID does not have to be forged (which matters: SeaBIOS finds the i440FX by
+ * device ID to set up PAM and PIIX interrupt routing).
+ *
+ * Registers are the 440BX ones agp_intel actually touches: APBASE (BAR0),
+ * APSIZE, ATTBASE, AGPCTRL and ERRSTS. NBXCFG (0x50) needs nothing: config
+ * space from 0x40 up is writable storage by default.
+ *
+ * The aperture is plain RAM, not a translation through the guest's GATT.
+ * That is a deliberate deviation, and the reason is that the guest CPU
+ * renders into the aperture: under KVM the window has to be a RAM memory slot
+ * or every pixel becomes an MMIO exit, and neither an IOMMU memory region nor
+ * a per-page alias fan-out can be that. So the aperture is the storage, the
+ * pages the guest binds into the GATT are shadowed rather than used, and an
+ * emulated bus-master reading an aperture address sees exactly what the CPU
+ * wrote there. This is indistinguishable from real translation as long as the
+ * guest reaches AGP memory only through the aperture - which is what
+ * FreeBSD's agp(4) does, since agp_mmap() hands out aperture page numbers -
+ * and as long as no two GATT entries alias the same page.
+ *
+ * APSIZE is writable because agp_intel probes the aperture-size mask by
+ * writing 0x3f and reading it back, but the BAR keeps the size it was
+ * realized with; shrinking APSIZE only shrinks the GATT the guest builds.
+ */
+#define I440FX_ERRSTS   0x91 /* 2 bytes, write-1-to-clear */
+#define I440FX_AGPCTRL  0xb0
+#define I440FX_APSIZE   0xb4
+#define I440FX_ATTBASE  0xb8
+
+#define I440FX_AGP_CAP        0xa0 /* where the 440BX puts it */
+#define I440FX_AGP_CAP_SIZE   0x0c /* id/next/rev, AGPSTAT, AGPCMD */
+#define I440FX_AGP_STATUS     0x04 /* offsets within the capability */
+#define I440FX_AGP_COMMAND    0x08
+
+#define I440FX_APSIZE_MASK    0x3f
+
+/*
+ * AGP 2.0, 1x and 2x, side-band addressing, 31-deep request queue: what a
+ * 440BX reports. Nothing here reads it except agp_get_info()'s ai_mode and
+ * agp_v2_enable()'s rate negotiation.
+ */
+#define I440FX_AGP_STATUS_VALUE 0x1f000203
+#define I440FX_AGP_COMMAND_MASK 0x1f000317
+
+#define I440FX_AGP_APERTURE_SIZE_DEFAULT (128 * MiB)
+
+/* APSIZE encodes (size / 4 MiB - 1), inverted against the mask. */
+static uint8_t i440fx_agp_apsize(uint64_t size)
+{
+    return ((size / (4 * MiB)) - 1) ^ I440FX_APSIZE_MASK;
+}
+
+static uint64_t i440fx_agp_aperture(PCIDevice *dev)
+{
+    uint8_t apsize = dev->config[I440FX_APSIZE] & I440FX_APSIZE_MASK;
+
+    return ((uint64_t)((apsize ^ I440FX_APSIZE_MASK) + 1)) * 4 * MiB;
+}
+
+static void i440fx_agp_realize(PCIDevice *dev, Error **errp)
+{
+    ERRP_GUARD();
+    PCII440FXState *f = I440FX_PCI_DEVICE(dev);
+    uint64_t size = f->agp_aperture_size;
+
+    if (!is_power_of_2(size) || size < 4 * MiB || size > 256 * MiB) {
+        error_setg(errp, "agp-aperture-size must be a power of 2 "
+                   "between 4 MiB and 256 MiB");
+        return;
+    }
+
+    if (pci_add_capability(dev, PCI_CAP_ID_AGP, I440FX_AGP_CAP,
+                           I440FX_AGP_CAP_SIZE, errp) < 0) {
+        return;
+    }
+    dev->config[I440FX_AGP_CAP + 2] = 0x20; /* revision 2.0 */
+    pci_set_long(dev->config + I440FX_AGP_CAP + I440FX_AGP_STATUS,
+                 I440FX_AGP_STATUS_VALUE);
+    pci_set_long(dev->wmask + I440FX_AGP_CAP + I440FX_AGP_COMMAND,
+                 I440FX_AGP_COMMAND_MASK);
+
+    memory_region_init_ram(&f->agp_aperture, OBJECT(dev),
+                           "i440fx-agp-aperture", size, errp);
+    if (*errp) {
+        return;
+    }
+    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY |
+                     PCI_BASE_ADDRESS_MEM_PREFETCH, &f->agp_aperture);
+
+    dev->config[I440FX_APSIZE] = i440fx_agp_apsize(size);
+    dev->wmask[I440FX_APSIZE] = I440FX_APSIZE_MASK;
+    pci_set_long(dev->wmask + I440FX_ATTBASE, 0xfffff000);
+    pci_set_long(dev->wmask + I440FX_AGPCTRL, 0x00003f80);
+    /* wmask is 0xff from 0x40 up by default, and must not overlap w1cmask. */
+    dev->wmask[I440FX_ERRSTS] = 0;
+    dev->wmask[I440FX_ERRSTS + 1] = 0;
+    dev->w1cmask[I440FX_ERRSTS] = 0xff;
+    dev->w1cmask[I440FX_ERRSTS + 1] = 0xff;
+}
+
 static void i440fx_realize(PCIDevice *dev, Error **errp)
 {
+    PCII440FXState *f = I440FX_PCI_DEVICE(dev);
+
     dev->config[I440FX_SMRAM] = 0x02;
 
     if (object_property_get_bool(qdev_get_machine(), "iommu", NULL)) {
         warn_report("i440fx doesn't support emulated iommu");
+    }
+
+    if (f->agp) {
+        i440fx_agp_realize(dev, errp);
     }
 }
 
@@ -109,6 +226,11 @@ static void i440fx_write_config(PCIDevice *dev,
     if (ranges_overlap(address, len, I440FX_PAM, I440FX_PAM_SIZE) ||
         range_covers_byte(address, len, I440FX_SMRAM)) {
         i440fx_update_memory_mappings(d);
+    }
+    if (d->agp && ranges_overlap(address, len, I440FX_AGPCTRL, 12)) {
+        trace_i440fx_agp_config_write(address, val, len,
+                                      pci_get_long(dev->config + I440FX_ATTBASE),
+                                      i440fx_agp_aperture(dev));
     }
 }
 
@@ -326,6 +448,12 @@ static void i440fx_pcihost_realize(DeviceState *dev, Error **errp)
     i440fx_update_memory_mappings(f);
 }
 
+static const Property i440fx_pci_props[] = {
+    DEFINE_PROP_BOOL("agp", PCII440FXState, agp, false),
+    DEFINE_PROP_SIZE("agp-aperture-size", PCII440FXState, agp_aperture_size,
+                     I440FX_AGP_APERTURE_SIZE_DEFAULT),
+};
+
 static void i440fx_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -339,6 +467,7 @@ static void i440fx_class_init(ObjectClass *klass, const void *data)
     k->class_id = PCI_CLASS_BRIDGE_HOST;
     dc->desc = "Host bridge";
     dc->vmsd = &vmstate_i440fx;
+    device_class_set_props(dc, i440fx_pci_props);
     /*
      * PCI-facing part of the host bridge, not usable without the
      * host-facing part, which can't be device_add'ed, yet.

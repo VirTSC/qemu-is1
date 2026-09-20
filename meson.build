@@ -1778,6 +1778,16 @@ if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
     error('epoxy/egl.h not found')
   endif
 endif
+# is1gl (IntelliStar 1 GL replay) takes its host GL context from OSMesa:
+# off-screen software rendering, no window system, and a real compatibility
+# profile. It is also the only one of the options that exists on macOS, which
+# has no EGL at all. Without it the device falls back to is1gl-stub.c.
+osmesa = not_found
+if not get_option('osmesa').disabled() and have_system
+  osmesa = dependency('osmesa', method: 'pkg-config',
+                      required: get_option('osmesa'))
+endif
+
 gbm = not_found
 if (have_system or have_tools) and (virgl.found() or opengl.found())
   gbm = dependency('gbm', method: 'pkg-config', required: false)

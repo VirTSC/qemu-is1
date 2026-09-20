@@ -884,6 +884,19 @@ SRST
 ERST
 
     {
+        .name       = "is1gl",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show IntelliStar GL transport state",
+        .cmd        = hmp_info_is1gl,
+    },
+
+SRST
+  ``info is1gl``
+    Show the IntelliStar GL command transport's ring and counters.
+ERST
+
+    {
         .name       = "stats",
         .args_type  = "target:s,names:s?,provider:s?",
         .params     = "target [names] [provider]",

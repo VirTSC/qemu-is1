@@ -54,6 +54,23 @@ struct PCIIDEState {
     MemoryRegion bmdma_bar;
     MemoryRegion cmd_bar[2];
     MemoryRegion data_bar[2];
+
+    /*
+     * Hold PCI Bus Master Enable set, as a period BIOS would have left it.
+     *
+     * The hardware default is clear and SeaBIOS never sets it - it writes
+     * PCI_COMMAND while sizing the BARs and then enables only IO | MEMORY |
+     * SERR. A guest that tests the bit rather than setting it therefore never
+     * gets DMA. FreeBSD 4.8's ata-pci is such a guest: it prints "Busmastering
+     * DMA not supported" and runs the disk in PIO for the life of the system.
+     *
+     * Setting it only at reset is not enough, because SeaBIOS's own writes
+     * come later and clear it; the bit is forced after every config write that
+     * touches the command register.
+     *
+     * Off by default, so the modelled chipset still matches its datasheet.
+     */
+    bool force_bus_master;
 };
 
 void bmdma_init(IDEBus *bus, BMDMAState *bm, PCIIDEState *d);

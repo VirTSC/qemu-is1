@@ -40,6 +40,21 @@ system_ss.add(when: 'CONFIG_SIFIVE_U_PRCI', if_true: files('sifive_u_prci.c'))
 subdir('macio')
 
 # ivshmem devices
+# Thunderstorm video overlay card (IntelliStar 1 emulation). Built
+# unconditionally: this is a purpose-built fork, and gating it behind Kconfig
+# would add moving parts for no benefit.
+system_ss.add(files('thunderstorm.c'))
+# is1gl needs OSMesa for its host GL context - see the comment at the top of
+# is1gl.c. Without it the device still exists but reports that it was built
+# without GL.
+if osmesa.found()
+  system_ss.add(when: osmesa,
+                if_true: [files('is1gl.c'), osmesa],
+                if_false: files('is1gl-stub.c'))
+else
+  system_ss.add(files('is1gl-stub.c'))
+endif
+
 system_ss.add(when: 'CONFIG_IVSHMEM_DEVICE', if_true: files('ivshmem-pci.c'))
 system_ss.add(when: 'CONFIG_IVSHMEM_FLAT_DEVICE', if_true: files('ivshmem-flat.c'))
 

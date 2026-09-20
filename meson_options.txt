@@ -208,6 +208,8 @@ option('pvg', type: 'feature', value: 'auto',
        description: 'macOS paravirtualized graphics support')
 option('rbd', type : 'feature', value : 'auto',
        description: 'Ceph block device driver')
+option('osmesa', type : 'feature', value : 'auto',
+       description: 'OSMesa, the host GL backend for the is1gl device')
 option('opengl', type : 'feature', value : 'auto',
        description: 'OpenGL support')
 option('rdma', type : 'feature', value : 'auto',

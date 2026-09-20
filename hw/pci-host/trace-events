@@ -80,3 +80,6 @@ elroy_pci_config_data_read(uint64_t addr, int size, uint64_t val) "addr 0x%"PRIx
 elroy_pci_config_data_write(uint64_t addr, int size, uint64_t val) "addr 0x%"PRIx64" size %d val 0x%"PRIx64
 iosapic_reg_write(uint64_t reg_select, int size, uint64_t val) "reg_select 0x%"PRIx64" size %d val 0x%"PRIx64
 iosapic_reg_read(uint64_t reg_select, int size, uint64_t val) "reg_select 0x%"PRIx64" size %d val 0x%"PRIx64
+
+# i440fx.c
+i440fx_agp_config_write(uint32_t addr, uint32_t val, int len, uint32_t attbase, uint64_t aperture) "reg 0x%02x = 0x%08x (%d bytes) attbase 0x%08x aperture %" PRIu64 " bytes"

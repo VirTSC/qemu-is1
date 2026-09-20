@@ -33,6 +33,7 @@
 #include "hw/ide/piix.h"
 #include "hw/ide/pci.h"
 #include "ide-internal.h"
+#include "hw/core/qdev-properties.h"
 #include "trace.h"
 
 static uint64_t bmdma_read(void *opaque, hwaddr addr, unsigned size)
@@ -114,7 +115,15 @@ static void piix_ide_reset(DeviceState *dev)
         ide_bus_reset(&d->bus[i]);
     }
 
-    /* PCI command register default value (0000h) per [1, p.48].  */
+    /*
+     * PCI command register default value (0000h) per [1, p.48].
+     *
+     * force_bus_master is deliberately NOT applied here: setting the bit at
+     * reset is both too early - the firmware's own writes come later and clear
+     * it - and wrong, because poking the register directly skips the
+     * bus-master bookkeeping. pci_piix_ide_write_config() folds it into the
+     * firmware's write instead.
+     */
     pci_set_word(pci_conf + PCI_COMMAND, 0x0000);
     pci_set_word(pci_conf + PCI_STATUS,
                  PCI_STATUS_DEVSEL_MEDIUM | PCI_STATUS_FAST_BACK);
@@ -177,6 +186,36 @@ static void pci_piix_ide_exitfn(PCIDevice *dev)
     }
 }
 
+
+static const Property piix_ide_properties[] = {
+    DEFINE_PROP_BOOL("force-bus-master", PCIIDEState, force_bus_master, false),
+};
+
+/*
+ * Keep PCI_COMMAND_MASTER set whatever the guest or its firmware writes. See
+ * the comment on force_bus_master in include/hw/ide/pci.h.
+ *
+ * The bit is folded into the value BEFORE the write rather than poked into
+ * the config space afterwards. Writing it afterwards sets the byte the guest
+ * reads back - enough for FreeBSD to report WDMA2 - while bypassing the
+ * bus-master bookkeeping pci_default_write_config() does for a write that
+ * touches the command register. The device's DMA address space then stays
+ * disabled, so every transfer silently reads zeroes and reports no error, and
+ * the guest sees an empty disk.
+ */
+static void pci_piix_ide_write_config(PCIDevice *dev, uint32_t addr,
+                                      uint32_t val, int len)
+{
+    PCIIDEState *d = PCI_IDE(dev);
+
+    /* PCI_COMMAND_MASTER lives in the low byte of the command word. */
+    if (d->force_bus_master && addr <= PCI_COMMAND && addr + len > PCI_COMMAND) {
+        val |= (uint32_t)PCI_COMMAND_MASTER << ((PCI_COMMAND - addr) * 8);
+    }
+
+    pci_default_write_config(dev, addr, val, len);
+}
+
 /* NOTE: for the PIIX3, the IRQs and IOports are hardcoded */
 static void piix3_ide_class_init(ObjectClass *klass, const void *data)
 {
@@ -186,12 +225,14 @@ static void piix3_ide_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, piix_ide_reset);
     dc->vmsd = &vmstate_ide_pci;
     k->realize = pci_piix_ide_realize;
+    k->config_write = pci_piix_ide_write_config;
     k->exit = pci_piix_ide_exitfn;
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = PCI_DEVICE_ID_INTEL_82371SB_1;
     k->class_id = PCI_CLASS_STORAGE_IDE;
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
     dc->hotpluggable = false;
+    device_class_set_props(dc, piix_ide_properties);
 }
 
 static const TypeInfo piix3_ide_info = {
@@ -209,12 +250,14 @@ static void piix4_ide_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, piix_ide_reset);
     dc->vmsd = &vmstate_ide_pci;
     k->realize = pci_piix_ide_realize;
+    k->config_write = pci_piix_ide_write_config;
     k->exit = pci_piix_ide_exitfn;
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = PCI_DEVICE_ID_INTEL_82371AB;
     k->class_id = PCI_CLASS_STORAGE_IDE;
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
     dc->hotpluggable = false;
+    device_class_set_props(dc, piix_ide_properties);
 }
 
 static const TypeInfo piix4_ide_info = {
