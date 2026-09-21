@@ -149,6 +149,7 @@ struct Is1glState {
     QemuCond   cond;
     bool       thread_running;
     bool       stopping;
+    bool       replaying;
 
     uint32_t head;        /* guest's producer offset, from the doorbell */
     uint32_t tail;        /* our consumer offset */
@@ -382,6 +383,31 @@ static void is1gl_set_drawable(Is1glState *s, uint32_t w, uint32_t h)
         error_report("is1gl: framebuffer incomplete at %ux%u", w, h);
         return;
     }
+
+    /*
+     * Renderbuffer storage starts with undefined contents.  renderd normally
+     * paints only the regions needed by a product, and the card preview drops
+     * the alpha/key channel, so untouched transparent pixels otherwise expose
+     * allocator contents as high-entropy RGB noise.  This is especially easy
+     * to see with llvmpipe on macOS, where reused tile memory is not
+     * incidentally zeroed.
+     *
+     * glClearBufferfv ignores the current colour write mask and clear colour.
+     * The scissor still applies, so disable just that state temporarily.  No
+     * guest-visible GL state is changed by initializing the new attachment.
+     */
+    {
+        static const GLfloat transparent_black[4] = { 0, 0, 0, 0 };
+        GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+
+        if (scissor) {
+            glDisable(GL_SCISSOR_TEST);
+        }
+        glClearBufferfv(GL_COLOR, 0, transparent_black);
+        if (scissor) {
+            glEnable(GL_SCISSOR_TEST);
+        }
+    }
     s->draw_w = w;
     s->draw_h = h;
     trace_is1gl_drawable(w, h);
@@ -395,6 +421,16 @@ static long is1gl_host_image_bytes(int32_t w, int32_t h, uint32_t format,
     int bpp;
 
     if (w <= 0 || h <= 0) {
+        return 0;
+    }
+    /*
+     * The guest uses GL_NONE as an on-wire sentinel for a NULL pixels
+     * argument to glTexImage2D().  There is deliberately no image payload in
+     * that case.  This must be recognized here, before the generated replay
+     * code validates the record length; otherwise it rejects the record and
+     * the allocation path in is1gl_host_glTexImage2D() is unreachable.
+     */
+    if (type == GL_NONE) {
         return 0;
     }
     if (format == GL_YCBCR_MESA) {
@@ -846,6 +882,7 @@ static void *is1gl_render_thread(void *opaque)
             continue;
         }
         head = s->head;
+        s->replaying = true;
         qemu_mutex_unlock(&s->lock);
 
         /*
@@ -857,12 +894,29 @@ static void *is1gl_render_thread(void *opaque)
         is1gl_consume(s, head);
 
         qemu_mutex_lock(&s->lock);
+        s->replaying = false;
+        qemu_cond_broadcast(&s->cond);
     }
     qemu_mutex_unlock(&s->lock);
     return NULL;
 }
 
 /* --------------------------------------------------------------- arming */
+
+/*
+ * A replay batch uses raw pointers returned by address_space_map().  Mapping
+ * changes are rare (guest-library initialization/restart and device reset),
+ * so wait for the active batch instead of putting the mutex around every GL
+ * call and making ordinary doorbells contend with the renderer.
+ *
+ * Called with s->lock held.
+ */
+static void is1gl_wait_replay_idle(Is1glState *s)
+{
+    while (s->replaying) {
+        qemu_cond_wait(&s->cond, &s->lock);
+    }
+}
 
 static void is1gl_unmap_aperture(Is1glState *s)
 {
@@ -874,7 +928,7 @@ static void is1gl_unmap_aperture(Is1glState *s)
     }
 }
 
-/* Called with the BQL held, from the MMIO write handler. */
+/* Called with the BQL and s->lock held, or after the render thread stopped. */
 static void is1gl_map_aperture(Is1glState *s)
 {
     hwaddr len;
@@ -911,7 +965,7 @@ static void is1gl_unmap_ring(Is1glState *s)
     }
 }
 
-/* Called with the BQL held, from the MMIO write handler. */
+/* Called with the BQL and s->lock held, or after the render thread stopped. */
 static void is1gl_arm_ring(Is1glState *s)
 {
     hwaddr len;
@@ -1011,24 +1065,46 @@ static void is1gl_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     trace_is1gl_mmio_write(addr, val, size);
     switch (addr) {
     case IS1GL_REG_RING_LO:
+        qemu_mutex_lock(&s->lock);
+        is1gl_wait_replay_idle(s);
+        is1gl_unmap_ring(s);
         s->ring_base = (s->ring_base & ~0xffffffffULL) | (uint32_t)val;
+        qemu_mutex_unlock(&s->lock);
         break;
     case IS1GL_REG_RING_HI:
+        qemu_mutex_lock(&s->lock);
+        is1gl_wait_replay_idle(s);
+        is1gl_unmap_ring(s);
         s->ring_base = (s->ring_base & 0xffffffffULL) | ((uint64_t)val << 32);
+        qemu_mutex_unlock(&s->lock);
         break;
     case IS1GL_REG_RING_SZ:
+        qemu_mutex_lock(&s->lock);
+        is1gl_wait_replay_idle(s);
         s->ring_size = val;
         is1gl_arm_ring(s);
+        qemu_mutex_unlock(&s->lock);
         break;
     case IS1GL_REG_APER_LO:
+        qemu_mutex_lock(&s->lock);
+        is1gl_wait_replay_idle(s);
+        is1gl_unmap_aperture(s);
         s->aper_base = (s->aper_base & ~0xffffffffULL) | (uint32_t)val;
+        qemu_mutex_unlock(&s->lock);
         break;
     case IS1GL_REG_APER_HI:
+        qemu_mutex_lock(&s->lock);
+        is1gl_wait_replay_idle(s);
+        is1gl_unmap_aperture(s);
         s->aper_base = (s->aper_base & 0xffffffffULL) | ((uint64_t)val << 32);
+        qemu_mutex_unlock(&s->lock);
         break;
     case IS1GL_REG_APER_SZ:
+        qemu_mutex_lock(&s->lock);
+        is1gl_wait_replay_idle(s);
         s->aper_size = val;
         is1gl_map_aperture(s);
+        qemu_mutex_unlock(&s->lock);
         break;
     case IS1GL_REG_DOORBELL:
         is1gl_doorbell(s, val, "mmio");
@@ -1087,6 +1163,7 @@ static void is1gl_reset(DeviceState *dev)
     Is1glState *s = IS1GL(dev);
 
     qemu_mutex_lock(&s->lock);
+    is1gl_wait_replay_idle(s);
     is1gl_unmap_ring(s);
     is1gl_unmap_aperture(s);
     s->aper_base = 0;
