@@ -1491,7 +1491,7 @@ static bool ts_in_drain_audio(ThunderstormState *s, uint8_t *ring, size_t *n)
 static void ts_input_run(ThunderstormState *s)
 {
     size_t vbytes = (size_t)TS_VIDEO_IN_DWORDS * TS_VIDEO_LINES * 4;
-    uint64_t n = 0, skew = 0;
+    uint64_t skew = 0;
     uint8_t *vslot[TS_IN_VSLOTS];
     uint8_t *aring = g_malloc(TS_IN_ARING);
     size_t aring_n = 0, vfill = 0;
@@ -1544,7 +1544,6 @@ static void ts_input_run(ThunderstormState *s)
             qemu_mutex_unlock(&s->in_lock);
             vq_head = (vq_head + 1) % TS_IN_VSLOTS;
             vq_n--;
-            n++;
         }
 
         /*
@@ -1812,20 +1811,23 @@ static void ts_frame_fill(ThunderstormState *s, const uint8_t *vb)
  * success tears every frame and desynchronises the stream permanently; the
  * viewer showed 1.4 fps of garbage.
  *
- * So the remainder is carried to the next call. A new frame is never started
- * while the previous one is still going out, which means the reader always
- * sees whole frames in order, and congestion costs whole dropped frames
- * rather than a sheared picture. Nothing here ever blocks: this runs in the
- * main loop, and the console path's own comment records that 1.4 MB of work
- * here thirty times a second is what used to make the frame clock jitter.
+ * So the remainder is carried while a writable fd handler drains it. A new
+ * frame is never started while the previous one is still going out, which
+ * means the reader always sees whole frames in order, and congestion costs
+ * whole dropped frames rather than a sheared picture. Nothing here ever
+ * blocks: this runs in the main loop, and the console path's own comment
+ * records that doing 1.4 MB of work here thirty times a second is what used
+ * to make the frame clock jitter.
  */
+static void ts_stream_write(void *opaque);
+
 /*
  * Push whatever is left of the frame in flight. Returns true when the pipe
  * is empty of our data and a new frame may be started.
  *
- * A frame is 1.38 MB and the pipe holds at most 1 MiB, so one write per frame
- * period caps the stream at about fifteen frames a second. Calling this from
- * the frame tick as well doubles the opportunities and lets it keep up.
+ * The writable handler matters most on hosts such as macOS, which provide no
+ * way to enlarge a FIFO. Waiting for the next frame tick before each write
+ * would cap throughput at one small pipe-buffer's worth per frame period.
  */
 static bool ts_stream_flush(ThunderstormState *s)
 {
@@ -1841,9 +1843,17 @@ static bool ts_stream_flush(ThunderstormState *s)
     }
     if (!s->output_pending) {
         s->output_frames++;
+        qemu_set_fd_handler(s->output_fd, NULL, NULL, NULL);
         return true;
     }
     return false;
+}
+
+static void ts_stream_write(void *opaque)
+{
+    ThunderstormState *s = opaque;
+
+    ts_stream_flush(s);
 }
 
 static void ts_frame_stream(ThunderstormState *s, const uint8_t *vb)
@@ -1853,7 +1863,6 @@ static void ts_frame_stream(ThunderstormState *s, const uint8_t *vb)
     size_t total;
     uint32_t pairs = 0;
     hwaddr base;
-    ssize_t n;
     int row;
 
     if (s->output_fd < 0 || !s->agp_stride) {
@@ -1911,13 +1920,8 @@ static void ts_frame_stream(ThunderstormState *s, const uint8_t *vb)
 
     s->output_off = 0;
     s->output_pending = total;
-    n = write(s->output_fd, s->output_buf, total);
-    if (n > 0) {
-        s->output_off = (size_t)n;
-        s->output_pending = total - (size_t)n;
-    }
-    if (!s->output_pending) {
-        s->output_frames++;
+    if (!ts_stream_flush(s)) {
+        qemu_set_fd_handler(s->output_fd, NULL, ts_stream_write, s);
     }
 }
 
@@ -2870,6 +2874,7 @@ static void thunderstorm_realize(PCIDevice *pdev, Error **errp)
          * /proc/sys/fs/pipe-max-size; take whatever we are given.
          */
         {
+#if defined(F_SETPIPE_SZ) && defined(F_GETPIPE_SZ)
             /*
              * Take the biggest pipe the kernel will give us, down to the
              * 64 KiB default. /proc/sys/fs/pipe-max-size caps this at 1 MiB
@@ -2893,6 +2898,10 @@ static void thunderstorm_realize(PCIDevice *pdev, Error **errp)
             if (s->output_pipe_sz < 0) {
                 s->output_pipe_sz = 0;
             }
+#else
+            /* Pipe-size fcntls are Linux-specific. */
+            s->output_pipe_sz = 0;
+#endif
             trace_thunderstorm_output_pipe(s->output_pipe_sz);
         }
         trace_thunderstorm_output_open(s->output, TS_VIDEO_ACTIVE,
