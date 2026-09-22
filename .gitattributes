@@ -7,3 +7,6 @@
 Cargo.lock      diff=toml merge=binary
 
 *.patch         -text -whitespace
+
+# Keep the shared is1gl opcode header in LF format across checkouts.
+hw/misc/is1gl_ops.h text eol=lf
