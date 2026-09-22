@@ -55,13 +55,63 @@
  * exist on macOS and carrying two copies of Mesa in one process lets the
  * dynamic linker interpose one's glBegin on the other's context.
  *
- * libOSMesa exports the whole GL entry point set itself, including the FBO
- * calls, so this links it directly rather than going through epoxy.
+ * libOSMesa exports the whole GL entry point set itself on Unix, including
+ * the FBO calls, so this links it directly rather than going through epoxy.
+ * The Windows DLL follows the platform convention and exposes post-1.1 GL
+ * entry points through OSMesaGetProcAddress(); those few calls are resolved
+ * below after the context is current.
  */
 #define GL_GLEXT_PROTOTYPES 1
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <GL/osmesa.h>
+
+#ifdef _WIN32
+static PFNGLBINDFRAMEBUFFERPROC is1gl_glBindFramebuffer;
+static PFNGLBINDRENDERBUFFERPROC is1gl_glBindRenderbuffer;
+static PFNGLCHECKFRAMEBUFFERSTATUSPROC is1gl_glCheckFramebufferStatus;
+static PFNGLCLEARBUFFERFVPROC is1gl_glClearBufferfv;
+static PFNGLFRAMEBUFFERRENDERBUFFERPROC is1gl_glFramebufferRenderbuffer;
+static PFNGLGENFRAMEBUFFERSPROC is1gl_glGenFramebuffers;
+static PFNGLGENRENDERBUFFERSPROC is1gl_glGenRenderbuffers;
+static PFNGLRENDERBUFFERSTORAGEPROC is1gl_glRenderbufferStorage;
+
+#define glBindFramebuffer is1gl_glBindFramebuffer
+#define glBindRenderbuffer is1gl_glBindRenderbuffer
+#define glCheckFramebufferStatus is1gl_glCheckFramebufferStatus
+#define glClearBufferfv is1gl_glClearBufferfv
+#define glFramebufferRenderbuffer is1gl_glFramebufferRenderbuffer
+#define glGenFramebuffers is1gl_glGenFramebuffers
+#define glGenRenderbuffers is1gl_glGenRenderbuffers
+#define glRenderbufferStorage is1gl_glRenderbufferStorage
+
+static bool is1gl_load_gl_extensions(void)
+{
+#define IS1GL_LOAD_GL(name, type)                                      \
+    do {                                                               \
+        is1gl_##name = (type)OSMesaGetProcAddress(#name);              \
+        if (!is1gl_##name) {                                           \
+            error_report("is1gl: OSMesa entry point %s is unavailable", \
+                         #name);                                       \
+            return false;                                              \
+        }                                                              \
+    } while (0)
+
+    IS1GL_LOAD_GL(glBindFramebuffer, PFNGLBINDFRAMEBUFFERPROC);
+    IS1GL_LOAD_GL(glBindRenderbuffer, PFNGLBINDRENDERBUFFERPROC);
+    IS1GL_LOAD_GL(glCheckFramebufferStatus,
+                  PFNGLCHECKFRAMEBUFFERSTATUSPROC);
+    IS1GL_LOAD_GL(glClearBufferfv, PFNGLCLEARBUFFERFVPROC);
+    IS1GL_LOAD_GL(glFramebufferRenderbuffer,
+                  PFNGLFRAMEBUFFERRENDERBUFFERPROC);
+    IS1GL_LOAD_GL(glGenFramebuffers, PFNGLGENFRAMEBUFFERSPROC);
+    IS1GL_LOAD_GL(glGenRenderbuffers, PFNGLGENRENDERBUFFERSPROC);
+    IS1GL_LOAD_GL(glRenderbufferStorage, PFNGLRENDERBUFFERSTORAGEPROC);
+
+#undef IS1GL_LOAD_GL
+    return true;
+}
+#endif
 
 #include "is1gl_ops.h"
 
@@ -346,6 +396,11 @@ static bool is1gl_gl_init(Is1glState *s)
     if (!is1gl_ctx_create(s)) {
         return false;
     }
+#ifdef _WIN32
+    if (!is1gl_load_gl_extensions()) {
+        return false;
+    }
+#endif
     s->gl_ready = true;
     s->gl_failed = false;
 
