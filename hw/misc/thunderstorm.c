@@ -39,6 +39,7 @@
 #include "qemu/module.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
+#include "qemu/audio.h"
 #include "ui/console.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -309,6 +310,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(ThunderstormFn1State, THUNDERSTORM_FN1)
 #define TS_OUTPUT_MAGIC  0x32535449   /* 'ITS2' */
 #define TS_OUTPUT_HDR    32
 #define TS_OUTPUT_RATE   48000
+#define TS_PROGRAM_AUDIO_BPF (2 * sizeof(uint32_t))
+#define TS_PROGRAM_AUDIO_PRIME \
+    (TS_OUTPUT_RATE * TS_PROGRAM_AUDIO_BPF * 150 / 1000)
+#define TS_PROGRAM_AUDIO_CAP \
+    (TS_OUTPUT_RATE * TS_PROGRAM_AUDIO_BPF * 3)
 /*
  * The last two members of TSH_FRAME, after audioCount and vbiTypes[45].
  * vbiTypes is 45 bytes of unsigned char starting at 2074628, so it ends at
@@ -378,12 +384,38 @@ struct ThunderstormState {
     uint32_t *pattern;      /* TS_VIDEO_ACTIVE * TS_VIDEO_LINES, or NULL */
     uint64_t frames_filled;
 
-    /* The card's video output, presented as a second QEMU console. */
+    /* Legacy rate-limited card preview, used only as a fallback console. */
     QemuConsole *con;
     bool display;
     uint32_t display_rate;   /* console refreshes per second */
     int64_t display_last;
     uint64_t frames_shown;
+
+    /*
+     * Full-rate programme output.  This is the in-process equivalent of
+     * tools/is1view: the card's single visible QEMU console carries the newest
+     * 720x480 picture, while a QEMU audio voice carries every 48 kHz stereo
+     * sample block.
+     * Video may be coalesced by SPICE; audio is buffered independently and
+     * must remain continuous.
+     */
+    QemuConsole *program_con;
+    bool program_display;
+    bool program_audio;
+    uint8_t *program_frame;
+    uint32_t program_pairs;
+    bool program_frame_valid;
+    uint64_t program_frames;
+
+    AudioBackend *audio_be;
+    SWVoiceOut *program_voice;
+    uint8_t *program_aring;
+    size_t program_aring_cap;
+    size_t program_aring_read;
+    size_t program_aring_write;
+    size_t program_aring_n;
+    bool program_audio_primed;
+    uint64_t program_audio_dropped;
 
     /*
      * What goes in v4l2_buffer.timestamp (stamp_t, a raw s64). The card's
@@ -561,6 +593,8 @@ static void ts_frame_push(ThunderstormState *s, uint32_t device,
                           const uint8_t *vb);
 static void ts_stream_start(ThunderstormState *s);
 static void ts_frame_present(ThunderstormState *s, const uint8_t *vb);
+static void ts_program_capture(ThunderstormState *s, const uint8_t *vb);
+static void ts_program_present(ThunderstormState *s);
 static void ts_frame_stream(ThunderstormState *s, const uint8_t *vb);
 static bool ts_stream_flush(ThunderstormState *s);
 static void ts_frame_audio(ThunderstormState *s, const uint8_t *vb);
@@ -824,6 +858,8 @@ static void ts_msg_process(ThunderstormState *s, uint32_t mfa)
              * hand it back, so doing it early is equally correct and keeps the
              * timer free to fire on time.
              */
+            ts_program_capture(s, m + TS_MSG_DATA);
+            ts_program_present(s);
             ts_frame_present(s, m + TS_MSG_DATA);
             ts_frame_stream(s, m + TS_MSG_DATA);
             ts_frame_audio(s, m + TS_MSG_DATA);
@@ -1491,7 +1527,7 @@ static bool ts_in_drain_audio(ThunderstormState *s, uint8_t *ring, size_t *n)
 static void ts_input_run(ThunderstormState *s)
 {
     size_t vbytes = (size_t)TS_VIDEO_IN_DWORDS * TS_VIDEO_LINES * 4;
-    uint64_t n = 0, skew = 0;
+    uint64_t skew = 0;
     uint8_t *vslot[TS_IN_VSLOTS];
     uint8_t *aring = g_malloc(TS_IN_ARING);
     size_t aring_n = 0, vfill = 0;
@@ -1544,7 +1580,6 @@ static void ts_input_run(ThunderstormState *s)
             qemu_mutex_unlock(&s->in_lock);
             vq_head = (vq_head + 1) % TS_IN_VSLOTS;
             vq_n--;
-            n++;
         }
 
         /*
@@ -1791,6 +1826,156 @@ static void ts_frame_fill(ThunderstormState *s, const uint8_t *vb)
 
 /* ------------------------------------------------------- video output */
 
+static void ts_program_audio_drain(ThunderstormState *s, size_t avail)
+{
+    while (avail && s->program_aring_n) {
+        size_t chunk = MIN(avail, s->program_aring_n);
+        size_t contiguous = s->program_aring_cap - s->program_aring_read;
+        size_t written;
+
+        chunk = MIN(chunk, contiguous);
+        written = audio_be_write(s->audio_be, s->program_voice,
+                                 s->program_aring + s->program_aring_read,
+                                 chunk);
+        if (!written) {
+            break;
+        }
+        s->program_aring_read =
+            (s->program_aring_read + written) % s->program_aring_cap;
+        s->program_aring_n -= written;
+        avail -= written;
+    }
+
+    if (!s->program_aring_n && s->program_audio_primed) {
+        /* Re-prime after a real underrun instead of clicking repeatedly. */
+        s->program_audio_primed = false;
+        audio_be_set_active_out(s->audio_be, s->program_voice, false);
+    }
+}
+
+static void ts_program_audio_cb(void *opaque, int avail)
+{
+    ts_program_audio_drain(opaque, avail > 0 ? (size_t)avail : 0);
+}
+
+static void ts_program_audio_enqueue(ThunderstormState *s,
+                                     const uint8_t *samples,
+                                     uint32_t pairs)
+{
+    size_t bytes = (size_t)pairs * TS_PROGRAM_AUDIO_BPF;
+    size_t i;
+
+    if (!s->program_voice || !pairs ||
+        bytes > s->program_aring_cap - s->program_aring_n) {
+        if (pairs && s->program_voice) {
+            s->program_audio_dropped++;
+            if (s->program_audio_dropped == 1) {
+                warn_report("thunderstorm: programme audio ring overflow; "
+                            "dropping one complete frame block");
+            }
+        }
+        return;
+    }
+
+    for (i = 0; i < (size_t)pairs * 2; i++) {
+        uint8_t scaled[4];
+        uint32_t sample = ldl_le_p(samples + i * 4) << 8;
+        size_t first;
+
+        stl_le_p(scaled, sample);
+        first = MIN(sizeof(scaled),
+                    s->program_aring_cap - s->program_aring_write);
+        memcpy(s->program_aring + s->program_aring_write, scaled, first);
+        if (first != sizeof(scaled)) {
+            memcpy(s->program_aring, scaled + first,
+                   sizeof(scaled) - first);
+        }
+        s->program_aring_write =
+            (s->program_aring_write + sizeof(scaled)) % s->program_aring_cap;
+        s->program_aring_n += sizeof(scaled);
+    }
+
+    if (!s->program_audio_primed &&
+        s->program_aring_n >= TS_PROGRAM_AUDIO_PRIME) {
+        s->program_audio_primed = true;
+        audio_be_set_active_out(s->audio_be, s->program_voice, true);
+    }
+}
+
+/*
+ * Capture the programme output once per completed card frame.  Both native
+ * consoles and the audio voice consume this cache, avoiding the duplicate
+ * 1.4 MB DMA reads that previously disturbed the card's frame clock.
+ */
+static void ts_program_capture(ThunderstormState *s, const uint8_t *vb)
+{
+    uint32_t index = ldl_le_p(vb + TS_VB_INDEX);
+    hwaddr base;
+    int row;
+
+    s->program_frame_valid = false;
+    s->program_pairs = 0;
+    if ((!s->program_display && !s->program_audio) || !s->agp_stride) {
+        return;
+    }
+    if (s->agp_count && index >= s->agp_count) {
+        return;
+    }
+    base = (hwaddr)s->agp_base + s->agp_offset +
+           (hwaddr)index * s->agp_stride;
+
+    if (s->program_display) {
+        for (row = 0; row < TS_VIDEO_LINES; row++) {
+            pci_dma_read(PCI_DEVICE(s),
+                         base + (hwaddr)row * TS_VIDEO_STRIDE,
+                         s->program_frame +
+                         (size_t)row * TS_VIDEO_ACTIVE * 4,
+                         TS_VIDEO_ACTIVE * 4);
+        }
+        s->program_frame_valid = true;
+    }
+
+    if (s->program_audio) {
+        uint8_t count_raw[4];
+        uint8_t samples[TS_AUDIO_SAMPLES * 4];
+        uint32_t pairs;
+
+        pci_dma_read(PCI_DEVICE(s), base + TS_AUDIO_COUNT_OFF,
+                     count_raw, sizeof(count_raw));
+        pairs = MIN(ldl_le_p(count_raw), TS_AUDIO_SAMPLES / 2);
+        s->program_pairs = pairs;
+        if (pairs) {
+            pci_dma_read(PCI_DEVICE(s), base + TS_AUDIO_OFF, samples,
+                         (size_t)pairs * TS_PROGRAM_AUDIO_BPF);
+            ts_program_audio_enqueue(s, samples, pairs);
+        }
+    }
+}
+
+static void ts_program_present(ThunderstormState *s)
+{
+    DisplaySurface *surf;
+    uint8_t *dst;
+    int row, stride;
+
+    if (!s->program_con || !s->program_frame_valid) {
+        return;
+    }
+    surf = qemu_console_surface(s->program_con);
+    if (!surf) {
+        return;
+    }
+    dst = surface_data(surf);
+    stride = surface_stride(surf);
+    for (row = 0; row < TS_VIDEO_LINES; row++) {
+        memcpy(dst + (size_t)row * stride,
+               s->program_frame + (size_t)row * TS_VIDEO_ACTIVE * 4,
+               TS_VIDEO_ACTIVE * 4);
+    }
+    s->program_frames++;
+    qemu_console_update_full(s->program_con);
+}
+
 /*
  * Pull a frame out of AGP memory and put it on the card's console.
  *
@@ -1812,20 +1997,23 @@ static void ts_frame_fill(ThunderstormState *s, const uint8_t *vb)
  * success tears every frame and desynchronises the stream permanently; the
  * viewer showed 1.4 fps of garbage.
  *
- * So the remainder is carried to the next call. A new frame is never started
- * while the previous one is still going out, which means the reader always
- * sees whole frames in order, and congestion costs whole dropped frames
- * rather than a sheared picture. Nothing here ever blocks: this runs in the
- * main loop, and the console path's own comment records that 1.4 MB of work
- * here thirty times a second is what used to make the frame clock jitter.
+ * So the remainder is carried while a writable fd handler drains it. A new
+ * frame is never started while the previous one is still going out, which
+ * means the reader always sees whole frames in order, and congestion costs
+ * whole dropped frames rather than a sheared picture. Nothing here ever
+ * blocks: this runs in the main loop, and the console path's own comment
+ * records that doing 1.4 MB of work here thirty times a second is what used
+ * to make the frame clock jitter.
  */
+static void ts_stream_write(void *opaque);
+
 /*
  * Push whatever is left of the frame in flight. Returns true when the pipe
  * is empty of our data and a new frame may be started.
  *
- * A frame is 1.38 MB and the pipe holds at most 1 MiB, so one write per frame
- * period caps the stream at about fifteen frames a second. Calling this from
- * the frame tick as well doubles the opportunities and lets it keep up.
+ * The writable handler matters most on hosts such as macOS, which provide no
+ * way to enlarge a FIFO. Waiting for the next frame tick before each write
+ * would cap throughput at one small pipe-buffer's worth per frame period.
  */
 static bool ts_stream_flush(ThunderstormState *s)
 {
@@ -1841,9 +2029,17 @@ static bool ts_stream_flush(ThunderstormState *s)
     }
     if (!s->output_pending) {
         s->output_frames++;
+        qemu_set_fd_handler(s->output_fd, NULL, NULL, NULL);
         return true;
     }
     return false;
+}
+
+static void ts_stream_write(void *opaque)
+{
+    ThunderstormState *s = opaque;
+
+    ts_stream_flush(s);
 }
 
 static void ts_frame_stream(ThunderstormState *s, const uint8_t *vb)
@@ -1853,7 +2049,6 @@ static void ts_frame_stream(ThunderstormState *s, const uint8_t *vb)
     size_t total;
     uint32_t pairs = 0;
     hwaddr base;
-    ssize_t n;
     int row;
 
     if (s->output_fd < 0 || !s->agp_stride) {
@@ -1911,13 +2106,8 @@ static void ts_frame_stream(ThunderstormState *s, const uint8_t *vb)
 
     s->output_off = 0;
     s->output_pending = total;
-    n = write(s->output_fd, s->output_buf, total);
-    if (n > 0) {
-        s->output_off = (size_t)n;
-        s->output_pending = total - (size_t)n;
-    }
-    if (!s->output_pending) {
-        s->output_frames++;
+    if (!ts_stream_flush(s)) {
+        qemu_set_fd_handler(s->output_fd, NULL, ts_stream_write, s);
     }
 }
 
@@ -1952,9 +2142,6 @@ static void ts_frame_present(ThunderstormState *s, const uint8_t *vb)
         s->display_last = now;
     }
 
-    base = (hwaddr)s->agp_base + s->agp_offset +
-           (hwaddr)index * s->agp_stride;
-
     surf = qemu_console_surface(s->con);
     if (!surf) {
         return;
@@ -1968,9 +2155,17 @@ static void ts_frame_present(ThunderstormState *s, const uint8_t *vb)
      * than we show. Alpha is the key signal rather than transparency against
      * anything here, so it is dropped for display.
      */
+    base = (hwaddr)s->agp_base + s->agp_offset +
+           (hwaddr)index * s->agp_stride;
     for (row = 0; row < TS_VIDEO_LINES; row++) {
-        pci_dma_read(PCI_DEVICE(s), base + (hwaddr)row * TS_VIDEO_STRIDE,
-                     dst + (size_t)row * stride, TS_VIDEO_ACTIVE * 4);
+        if (s->program_frame_valid) {
+            memcpy(dst + (size_t)row * stride,
+                   s->program_frame + (size_t)row * TS_VIDEO_ACTIVE * 4,
+                   TS_VIDEO_ACTIVE * 4);
+        } else {
+            pci_dma_read(PCI_DEVICE(s), base + (hwaddr)row * TS_VIDEO_STRIDE,
+                         dst + (size_t)row * stride, TS_VIDEO_ACTIVE * 4);
+        }
     }
 
     s->frames_shown++;
@@ -2153,6 +2348,9 @@ static void ts_gfx_invalidate(void *opaque)
 
     if (s->con) {
         qemu_console_update_full(s->con);
+    }
+    if (s->program_con) {
+        qemu_console_update_full(s->program_con);
     }
 }
 
@@ -2809,9 +3007,45 @@ static void thunderstorm_realize(PCIDevice *pdev, Error **errp)
         fprintf(s->frame_log_f, "frame,tick_ns,delta_ns,queued,returned\n");
     }
 
-    if (s->present && s->display) {
+    /*
+     * Expose at most one card display.  The full-rate programme view is the
+     * default and occupies head 0, so frontends see one stable "tsc0" entry.
+     * Keep the old rate-limited view only as a fallback for configurations
+     * that explicitly turn program-display off.
+     */
+    if (s->present && s->program_display) {
+        s->program_frame = g_malloc((size_t)TS_VIDEO_ACTIVE *
+                                    TS_VIDEO_LINES * 4);
+        s->program_con = qemu_graphic_console_create(DEVICE(s), 0,
+                                                     &ts_gfx_ops, s);
+        qemu_console_resize(s->program_con, TS_VIDEO_ACTIVE, TS_VIDEO_LINES);
+    } else if (s->present && s->display) {
         s->con = qemu_graphic_console_create(DEVICE(s), 0, &ts_gfx_ops, s);
         qemu_console_resize(s->con, TS_VIDEO_ACTIVE, TS_VIDEO_LINES);
+    }
+
+    if (s->present && s->program_audio) {
+        struct audsettings as = {
+            .freq = TS_OUTPUT_RATE,
+            .nchannels = 2,
+            .fmt = AUDIO_FORMAT_S32,
+            .big_endian = false,
+        };
+
+        if (!audio_be_check(&s->audio_be, errp)) {
+            return;
+        }
+        s->program_aring_cap = TS_PROGRAM_AUDIO_CAP;
+        s->program_aring = g_malloc0(s->program_aring_cap);
+        s->program_voice = audio_be_open_out(s->audio_be, NULL,
+                                             "thunderstorm-program",
+                                             s, ts_program_audio_cb, &as);
+        if (!s->program_voice) {
+            error_setg(errp, "thunderstorm: cannot open programme audio output");
+            return;
+        }
+        /* Playback starts only after the same 150 ms prime as is1view. */
+        audio_be_set_active_out(s->audio_be, s->program_voice, false);
     }
 
     /*
@@ -2870,6 +3104,7 @@ static void thunderstorm_realize(PCIDevice *pdev, Error **errp)
          * /proc/sys/fs/pipe-max-size; take whatever we are given.
          */
         {
+#if defined(F_SETPIPE_SZ) && defined(F_GETPIPE_SZ)
             /*
              * Take the biggest pipe the kernel will give us, down to the
              * 64 KiB default. /proc/sys/fs/pipe-max-size caps this at 1 MiB
@@ -2893,6 +3128,10 @@ static void thunderstorm_realize(PCIDevice *pdev, Error **errp)
             if (s->output_pipe_sz < 0) {
                 s->output_pipe_sz = 0;
             }
+#else
+            /* Pipe-size fcntls are Linux-specific. */
+            s->output_pipe_sz = 0;
+#endif
             trace_thunderstorm_output_pipe(s->output_pipe_sz);
         }
         trace_thunderstorm_output_open(s->output, TS_VIDEO_ACTIVE,
@@ -2925,6 +3164,17 @@ static void thunderstorm_reset(DeviceState *dev)
     s->audio_seen = false;
     s->audio_probed = false;
     s->audio_mapped = false;
+    s->program_frame_valid = false;
+    s->program_frames = 0;
+    s->program_pairs = 0;
+    s->program_aring_read = 0;
+    s->program_aring_write = 0;
+    s->program_aring_n = 0;
+    s->program_audio_primed = false;
+    s->program_audio_dropped = 0;
+    if (s->program_voice) {
+        audio_be_set_active_out(s->audio_be, s->program_voice, false);
+    }
     memset(s->frames, 0, sizeof(s->frames));
     if (s->frame_timer) {
         timer_del(s->frame_timer);
@@ -2958,8 +3208,15 @@ static const Property thunderstorm_properties[] = {
      * uploads - is byte-identical to the 1.26.18 package's.
      */
     DEFINE_PROP_UINT32("version", ThunderstormState, version, 0x011a0012),
-    /* Present the card's video output as a second QEMU console. */
+    /* Legacy rate-limited display, used when program-display is off. */
     DEFINE_PROP_BOOL("display", ThunderstormState, display, true),
+    /* Preferred full-rate card display; supersedes the legacy display. */
+    DEFINE_PROP_BOOL("program-display", ThunderstormState,
+                     program_display, true),
+    /* Route the card's embedded programme audio through QEMU/SPICE. */
+    DEFINE_PROP_BOOL("program-audio", ThunderstormState,
+                     program_audio, true),
+    DEFINE_AUDIO_PROPERTIES(ThunderstormState, audio_be),
     /*
      * What the capture side hands the host, since there is no DVB-ASI feed:
      * "bars", "ramp" and "grid" (orientation and alignment probes),
