@@ -171,6 +171,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(Is1glState, IS1GL)
 #define RH_GUEST_SEQ  0x1c   /* guest writes */
 #define RH_ERRORS     0x20   /* host writes  */
 
+typedef struct Is1glGuestContext {
+    uint32_t id;
+    GLint viewport[4];
+    bool viewport_valid;
+} Is1glGuestContext;
+
 struct Is1glState {
     ISADevice parent_obj;
 
@@ -217,6 +223,16 @@ struct Is1glState {
     bool       gl_failed;
     GLuint     fbo, colour_rb;
     uint32_t   draw_w, draw_h;
+
+    /*
+     * QEMU deliberately uses one host compatibility context so both guest
+     * GLX contexts see the same textures, lists and drawable.  Viewport state
+     * is not shared by GLX contexts, however, so virtualize it explicitly.
+     */
+    GHashTable *guest_contexts; /* context id -> Is1glGuestContext */
+    uint32_t    guest_ctx;
+    uint64_t    context_switches;
+    GLint       current_viewport[4];
 
     /*
      * The AGP aperture, mapped once. Every readback destination is inside
@@ -409,6 +425,27 @@ static bool is1gl_gl_init(Is1glState *s)
     return true;
 }
 
+static Is1glGuestContext *is1gl_guest_context(Is1glState *s, uint32_t id)
+{
+    Is1glGuestContext *ctx;
+
+    ctx = g_hash_table_lookup(s->guest_contexts, GUINT_TO_POINTER(id));
+    if (!ctx) {
+        ctx = g_new0(Is1glGuestContext, 1);
+        ctx->id = id;
+        g_hash_table_insert(s->guest_contexts, GUINT_TO_POINTER(id), ctx);
+    }
+    return ctx;
+}
+
+static void is1gl_contexts_reset(Is1glState *s)
+{
+    g_hash_table_remove_all(s->guest_contexts);
+    s->guest_ctx = 0;
+    s->context_switches = 0;
+    memset(s->current_viewport, 0, sizeof(s->current_viewport));
+}
+
 /* The drawable is an FBO, because nothing is ever presented: the finished
  * frame leaves through glReadPixels into the card's own memory. */
 static void is1gl_set_drawable(Is1glState *s, uint32_t w, uint32_t h)
@@ -468,7 +505,59 @@ static void is1gl_set_drawable(Is1glState *s, uint32_t w, uint32_t h)
     trace_is1gl_drawable(w, h);
 }
 
+/*
+ * MAKE_CURRENT carries a guest context id even though the original replay
+ * path used only its drawable dimensions.  Restore the state that GL keeps
+ * per context.  This also fixes older guest shims already installed in disk
+ * images; newer shims emit the same restoration explicitly.
+ */
+static void is1gl_make_current(Is1glState *s, uint32_t id,
+                               uint32_t w, uint32_t h)
+{
+    Is1glGuestContext *ctx;
+
+    is1gl_set_drawable(s, w, h);
+    if (!s->gl_ready) {
+        return;
+    }
+
+    ctx = is1gl_guest_context(s, id);
+    if (!ctx->viewport_valid) {
+        ctx->viewport[0] = 0;
+        ctx->viewport[1] = 0;
+        ctx->viewport[2] = w;
+        ctx->viewport[3] = h;
+        ctx->viewport_valid = true;
+    }
+    s->guest_ctx = id;
+    s->context_switches++;
+    memcpy(s->current_viewport, ctx->viewport,
+           sizeof(s->current_viewport));
+    glViewport(ctx->viewport[0], ctx->viewport[1],
+               ctx->viewport[2], ctx->viewport[3]);
+}
+
 /* ------------------------------------------------------------ host hooks */
+
+static void is1gl_host_glViewport(Is1glState *s, int32_t x, int32_t y,
+                                  int32_t width, int32_t height)
+{
+    Is1glGuestContext *ctx;
+
+    if (s->guest_ctx) {
+        ctx = is1gl_guest_context(s, s->guest_ctx);
+        ctx->viewport[0] = x;
+        ctx->viewport[1] = y;
+        ctx->viewport[2] = width;
+        ctx->viewport[3] = height;
+        ctx->viewport_valid = true;
+    }
+    s->current_viewport[0] = x;
+    s->current_viewport[1] = y;
+    s->current_viewport[2] = width;
+    s->current_viewport[3] = height;
+    glViewport(x, y, width, height);
+}
 
 static long is1gl_host_image_bytes(int32_t w, int32_t h, uint32_t format,
                                    uint32_t type)
@@ -806,7 +895,8 @@ static void is1gl_consume(Is1glState *s, uint32_t head)
             break;
         case IS1GL_OP_MAKE_CURRENT:
             if (length >= 20) {
-                is1gl_set_drawable(s, ldl_le_p(data + tail + 12),
+                is1gl_make_current(s, ldl_le_p(data + tail + 8),
+                                   ldl_le_p(data + tail + 12),
                                    ldl_le_p(data + tail + 16));
             }
             break;
@@ -1027,6 +1117,8 @@ static void is1gl_arm_ring(Is1glState *s)
     void *p;
 
     is1gl_unmap_ring(s);
+    /* A new transport may reuse context ids from a restarted renderd. */
+    is1gl_contexts_reset(s);
     s->tail = 0;
     s->head = 0;
 
@@ -1230,6 +1322,7 @@ static void is1gl_reset(DeviceState *dev)
     s->bells_mmio = s->bells_io = 0;
     s->records = s->fences = s->wraps = 0;
     s->unknown_ops = s->bad_records = 0;
+    is1gl_contexts_reset(s);
     qemu_mutex_unlock(&s->lock);
 }
 
@@ -1240,6 +1333,8 @@ static void is1gl_realize(DeviceState *dev, Error **errp)
 
     qemu_mutex_init(&s->lock);
     qemu_cond_init(&s->cond);
+    s->guest_contexts = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                               NULL, g_free);
 
     /*
      * The MMIO page goes in the ISA bus's memory space, which on the pc
@@ -1294,6 +1389,7 @@ static void is1gl_unrealize(DeviceState *dev)
         fclose(s->frame_log_f);
         s->frame_log_f = NULL;
     }
+    g_clear_pointer(&s->guest_contexts, g_hash_table_destroy);
     qemu_cond_destroy(&s->cond);
     qemu_mutex_destroy(&s->lock);
 }
@@ -1346,6 +1442,12 @@ void hmp_info_is1gl(Monitor *mon, const QDict *qdict)
                    s->gl_ready ? (const char *)"up"
                                : (s->gl_failed ? "FAILED" : "not started"),
                    s->draw_w, s->draw_h, s->frames, s->readbacks);
+    monitor_printf(mon, "contexts   %u known  current %u  switches %" PRIu64
+                   "\n", g_hash_table_size(s->guest_contexts), s->guest_ctx,
+                   s->context_switches);
+    monitor_printf(mon, "viewport   %d,%d %dx%d\n",
+                   s->current_viewport[0], s->current_viewport[1],
+                   s->current_viewport[2], s->current_viewport[3]);
     if (s->frames) {
         static const char *labels[8] = {
             "   <5ms", " 5-10ms", "10-17ms", "17-25ms",
