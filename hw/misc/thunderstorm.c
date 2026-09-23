@@ -28,7 +28,9 @@
 
 #include "qemu/osdep.h"
 #include <math.h>
+#ifndef _WIN32
 #include <poll.h>
+#endif
 #include "system/rtc.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
@@ -1470,6 +1472,7 @@ static void ts_fill_audio(ThunderstormState *s, hwaddr base,
  */
 #define TS_IN_ARING (16 * 1602 * 2 * 4)
 
+#ifndef _WIN32
 /*
  * Pull whatever audio is available right now, without blocking. Returns
  * false only on EOF or a real error - "nothing there" is success.
@@ -1749,6 +1752,7 @@ static void *ts_input_open_thread(void *opaque)
     }
     return NULL;
 }
+#endif /* !_WIN32 */
 
 static void ts_frame_fill(ThunderstormState *s, const uint8_t *vb)
 {
@@ -2956,6 +2960,13 @@ static void thunderstorm_realize(PCIDevice *pdev, Error **errp)
      * ffmpeg turned up.
      */
     s->in_fd = s->in_afd = -1;
+#ifdef _WIN32
+    if (s->input_pipe) {
+        error_setg(errp, "thunderstorm: input-pipe is not yet supported on "
+                   "Windows; use input=bars, ramp, grid, black or none");
+        return;
+    }
+#else
     if (s->input_pipe) {
         size_t vbytes = (size_t)TS_VIDEO_IN_DWORDS * TS_VIDEO_LINES * 4;
 
@@ -2974,6 +2985,7 @@ static void thunderstorm_realize(PCIDevice *pdev, Error **errp)
                            QEMU_THREAD_JOINABLE);
         s->in_running = true;
     }
+#endif
 
     /*
      * vterm. Harmless when no chardev is attached: the guest's writes are
@@ -3081,6 +3093,14 @@ static void thunderstorm_realize(PCIDevice *pdev, Error **errp)
      * fill the pipe and fail with EAGAIN, which is counted and dropped.
      */
     s->output_fd = -1;
+#ifdef _WIN32
+    if (s->output && *s->output) {
+        error_setg(errp, "thunderstorm: output FIFO is not supported on "
+                   "Windows; use the built-in tsc0 display and programme "
+                   "audio");
+        return;
+    }
+#else
     if (s->output && *s->output) {
         struct stat st;
 
@@ -3137,6 +3157,7 @@ static void thunderstorm_realize(PCIDevice *pdev, Error **errp)
         trace_thunderstorm_output_open(s->output, TS_VIDEO_ACTIVE,
                                        TS_VIDEO_LINES);
     }
+#endif
 
     trace_thunderstorm_realize(PCI_SLOT(pdev->devfn), s->present, s->version);
 }

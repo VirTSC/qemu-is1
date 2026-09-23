@@ -58,59 +58,13 @@
 
 #define IS1GL_OP_COUNT 52
 
-#define IS1GL_OP_NAMES { \
-    "NOP", \
-    "WRAP", \
-    "FENCE", \
-    "MAKE_CURRENT", \
-    "SWAP", \
-    "READPIXELS", \
-    "glClearColor", \
-    "glClear", \
-    "glBlendFunc", \
-    "glLineWidth", \
-    "glScissor", \
-    "glClipPlane", \
-    "glEnable", \
-    "glDisable", \
-    "glPushAttrib", \
-    "glPopAttrib", \
-    "glPushClientAttrib", \
-    "glPopClientAttrib", \
-    "glMatrixMode", \
-    "glViewport", \
-    "glPushMatrix", \
-    "glPopMatrix", \
-    "glLoadIdentity", \
-    "glMultMatrixd", \
-    "glMultMatrixf", \
-    "glRotated", \
-    "glRotatef", \
-    "glScalef", \
-    "glTranslated", \
-    "glTranslatef", \
-    "glDeleteLists", \
-    "glNewList", \
-    "glEndList", \
-    "glCallList", \
-    "glBegin", \
-    "glEnd", \
-    "glVertex2d", \
-    "glVertex2f", \
-    "glColor4f", \
-    "glTexCoord2f", \
-    "glPixelStoref", \
-    "glPixelStorei", \
-    "glDrawPixels", \
-    "glTexEnvf", \
-    "glTexEnvi", \
-    "glTexParameterf", \
-    "glTexParameteri", \
-    "glTexImage2D", \
-    "glDeleteTextures", \
-    "glBindTexture", \
-    "glTexSubImage2D", \
-    "glCopyTexSubImage2D", \
-}
+#define IS1GL_OP_NAMES_0 "NOP", "WRAP", "FENCE", "MAKE_CURRENT", "SWAP", "READPIXELS", "glClearColor", "glClear"
+#define IS1GL_OP_NAMES_1 "glBlendFunc", "glLineWidth", "glScissor", "glClipPlane", "glEnable", "glDisable", "glPushAttrib", "glPopAttrib"
+#define IS1GL_OP_NAMES_2 "glPushClientAttrib", "glPopClientAttrib", "glMatrixMode", "glViewport", "glPushMatrix", "glPopMatrix", "glLoadIdentity", "glMultMatrixd"
+#define IS1GL_OP_NAMES_3 "glMultMatrixf", "glRotated", "glRotatef", "glScalef", "glTranslated", "glTranslatef", "glDeleteLists", "glNewList"
+#define IS1GL_OP_NAMES_4 "glEndList", "glCallList", "glBegin", "glEnd", "glVertex2d", "glVertex2f", "glColor4f", "glTexCoord2f"
+#define IS1GL_OP_NAMES_5 "glPixelStoref", "glPixelStorei", "glDrawPixels", "glTexEnvf", "glTexEnvi", "glTexParameterf", "glTexParameteri", "glTexImage2D"
+#define IS1GL_OP_NAMES_6 "glDeleteTextures", "glBindTexture", "glTexSubImage2D", "glCopyTexSubImage2D"
+#define IS1GL_OP_NAMES { IS1GL_OP_NAMES_0, IS1GL_OP_NAMES_1, IS1GL_OP_NAMES_2, IS1GL_OP_NAMES_3, IS1GL_OP_NAMES_4, IS1GL_OP_NAMES_5, IS1GL_OP_NAMES_6 }
 
 #endif
