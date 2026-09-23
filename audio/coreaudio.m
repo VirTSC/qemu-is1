@@ -139,6 +139,24 @@ static OSStatus coreaudio_set_out_streamformat(AudioDeviceID id,
                                       d);
 }
 
+static OSStatus coreaudio_get_out_streamformat(AudioDeviceID id,
+                                               AudioStreamBasicDescription *d)
+{
+    UInt32 size = sizeof(*d);
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyStreamFormat,
+        kAudioDevicePropertyScopeOutput,
+        kAudioObjectPropertyElementMain
+    };
+
+    return AudioObjectGetPropertyData(id,
+                                      &addr,
+                                      0,
+                                      NULL,
+                                      &size,
+                                      d);
+}
+
 static OSStatus coreaudio_get_out_isrunning(AudioDeviceID id, UInt32 *result)
 {
     UInt32 size = sizeof(*result);
@@ -443,6 +461,41 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
                                   "Could not set samplerate %lf",
                                   stream_basic_description.mSampleRate);
         return status;
+    }
+
+    /*
+     * Fixed-rate devices (Bluetooth, many USB and HDMI outputs) accept the
+     * request above with noErr and keep running at their own rate. Feeding
+     * them at the rate we asked for plays everything fast or slow and
+     * detunes it, so read back what the device actually runs at.
+     */
+    status = coreaudio_get_out_streamformat(device_id,
+                                            &stream_basic_description);
+    if (status == kAudioHardwareBadObjectError) {
+        return 0;
+    }
+    if (status != kAudioHardwareNoError) {
+        coreaudio_playback_logerr(status, "Could not get samplerate");
+        return status;
+    }
+    if ((int)stream_basic_description.mSampleRate != core->hw.info.freq) {
+        if (QLIST_EMPTY(&core->hw.sw_head)) {
+            /* No software voice has built a rate converter against us yet. */
+            warn_report("coreaudio: device does not support %d Hz, "
+                        "using its rate of %.0f Hz",
+                        core->hw.info.freq,
+                        stream_basic_description.mSampleRate);
+            core->hw.info.freq = (int)stream_basic_description.mSampleRate;
+            core->hw.info.bytes_per_second =
+                core->hw.info.freq * core->hw.info.bytes_per_frame;
+        } else {
+            warn_report("coreaudio: new output device runs at %.0f Hz, not "
+                        "%d Hz; audio will play at the wrong speed. Set "
+                        "out.frequency=%.0f on the audiodev",
+                        stream_basic_description.mSampleRate,
+                        core->hw.info.freq,
+                        stream_basic_description.mSampleRate);
+        }
     }
 
     /*
