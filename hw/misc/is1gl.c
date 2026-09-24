@@ -171,11 +171,35 @@ OBJECT_DECLARE_SIMPLE_TYPE(Is1glState, IS1GL)
 #define RH_GUEST_SEQ  0x1c   /* guest writes */
 #define RH_ERRORS     0x20   /* host writes  */
 
-typedef struct Is1glGuestContext {
-    uint32_t id;
-    GLint viewport[4];
-    bool viewport_valid;
-} Is1glGuestContext;
+/*
+ * A host context standing in for one guest GLX context.
+ *
+ * renderd has two: a loader thread creates textures, glyph pages and display
+ * lists in one, and the renderer draws in the other. The guest library puts
+ * a MAKE_CURRENT on the ring whenever the next call comes from the other
+ * context, and each guest context is replayed in a host context of its own,
+ * so everything GL keeps per context - bindings, enables, matrices, the
+ * current colour, the attribute stacks, display-list compile mode - stays
+ * apart exactly as it does under GLX. They are all in one share group, as
+ * the guest asked, so textures and display lists are common to all of them.
+ *
+ * This device used to replay every guest context in one host context, and
+ * keep only the viewport apart. That let the loader's glBindTexture change
+ * what the renderer drew with, and a glyph page overwritten with an image
+ * turned text into solid blocks.
+ *
+ * Framebuffer objects are the one kind of object contexts do not share, so
+ * each has its own, all attached to one shared colour renderbuffer: in the
+ * guest, both contexts are bound to the same X window.
+ */
+typedef struct Is1glHostCtx {
+    uint32_t      id;
+    OSMesaContext ctx;
+    GLuint        fbo;
+    void         *buf;          /* default framebuffer it was made current on */
+    uint32_t      buf_w, buf_h;
+    GLint         viewport[4];  /* a copy, for `info is1gl` */
+} Is1glHostCtx;
 
 struct Is1glState {
     ISADevice parent_obj;
@@ -212,27 +236,22 @@ struct Is1glState {
     uint32_t done_seq;
 
     /*
-     * The GL context and everything reached through it live on the render
+     * The GL contexts and everything reached through them live on the render
      * thread and are touched from nowhere else.
      */
-    OSMesaContext osmesa_ctx;
+    GHashTable   *host_ctxs;      /* guest context id -> Is1glHostCtx */
+    Is1glHostCtx *cur;            /* current on the render thread, or NULL */
+    OSMesaContext share_root;     /* the first context; the rest share it */
     void         *osmesa_buf;     /* backs the default framebuffer, unused */
     size_t        osmesa_buf_sz;
     uint32_t      osmesa_w, osmesa_h;
-    bool       gl_ready;
     bool       gl_failed;
-    GLuint     fbo, colour_rb;
+    bool       gl_reset;          /* drop every context before replaying on */
+    GLuint     colour_rb;
     uint32_t   draw_w, draw_h;
 
-    /*
-     * QEMU deliberately uses one host compatibility context so both guest
-     * GLX contexts see the same textures, lists and drawable.  Viewport state
-     * is not shared by GLX contexts, however, so virtualize it explicitly.
-     */
-    GHashTable *guest_contexts; /* context id -> Is1glGuestContext */
     uint32_t    guest_ctx;
     uint64_t    context_switches;
-    GLint       current_viewport[4];
 
     /*
      * The AGP aperture, mapped once. Every readback destination is inside
@@ -330,40 +349,22 @@ static double   get_f64(const uint8_t *p) { double v;   memcpy(&v, p, 8); return
 
 /*
  * The whole design depends on the host speaking fixed-function GL natively,
- * so that nothing has to be translated into shaders. That is why the context
- * below asks for a compatibility profile explicitly rather than going through
- * QEMU's own helpers, which ask for core.
+ * so that nothing has to be translated into shaders. That is why the
+ * contexts below ask for a compatibility profile explicitly rather than
+ * going through QEMU's own helpers, which ask for core.
  *
  * OSMesa renders into a caller-supplied buffer and has no notion of a window
  * system, which is exactly what this device wants: the finished frame leaves
  * through glReadPixels either way, and there is nothing to present.
  *
- * The buffer below backs the *default* framebuffer, which nothing ever draws
- * to - all rendering goes to the FBO in is1gl_set_drawable(). It exists only
- * because OSMesaMakeCurrent() insists on one. It is kept at the drawable size
- * so that a backend that did fall back to the default framebuffer would still
- * be correct rather than subtly clipped.
+ * The buffer backs the *default* framebuffer, which nothing ever draws to -
+ * all rendering goes to the FBOs in is1gl_set_drawable(). It exists only
+ * because OSMesaMakeCurrent() insists on one, and every context uses the same
+ * one. It is kept at the drawable size so that a backend that did fall back
+ * to the default framebuffer would still be correct rather than subtly
+ * clipped.
  */
-static bool is1gl_osmesa_current(Is1glState *s, uint32_t w, uint32_t h)
-{
-    size_t need = (size_t)w * h * 4;
-
-    if (need > s->osmesa_buf_sz) {
-        g_free(s->osmesa_buf);
-        s->osmesa_buf = g_malloc0(need);
-        s->osmesa_buf_sz = need;
-    }
-    if (!OSMesaMakeCurrent(s->osmesa_ctx, s->osmesa_buf, GL_UNSIGNED_BYTE,
-                           w, h)) {
-        error_report("is1gl: OSMesaMakeCurrent failed");
-        return false;
-    }
-    s->osmesa_w = w;
-    s->osmesa_h = h;
-    return true;
-}
-
-static bool is1gl_ctx_create(Is1glState *s)
+static OSMesaContext is1gl_osmesa_create(OSMesaContext share)
 {
     /*
      * Ask for a compatibility profile explicitly. The whole design depends on
@@ -382,97 +383,128 @@ static bool is1gl_ctx_create(Is1glState *s)
         OSMESA_CONTEXT_MINOR_VERSION, 0,
         0
     };
+    OSMesaContext c;
 
-    s->osmesa_ctx = OSMesaCreateContextAttribs(ctx_attr, NULL);
-    if (!s->osmesa_ctx) {
-        s->osmesa_ctx = OSMesaCreateContextExt(OSMESA_RGBA, 24, 8, 0, NULL);
+    c = OSMesaCreateContextAttribs(ctx_attr, share);
+    if (!c) {
+        c = OSMesaCreateContextExt(OSMESA_RGBA, 24, 8, 0, share);
     }
-    if (!s->osmesa_ctx) {
-        error_report("is1gl: cannot create an OSMesa context");
-        return false;
+    return c;
+}
+
+/* GL errors belong to a context, so collect them before leaving one. */
+static void is1gl_drain_errors(Is1glState *s)
+{
+    GLenum e;
+
+    while ((e = glGetError()) != GL_NO_ERROR) {
+        s->gl_errors++;
+        if (s->gl_errors <= 16) {
+            trace_is1gl_gl_error(e, s->frames);
+        }
     }
-    /* NTSC to begin with; is1gl_set_drawable() resizes if the guest differs. */
-    return is1gl_osmesa_current(s, 720, 480);
 }
 
 /*
- * Phase 0d confirmed the host offers 4.3 Compatibility and
- * GL_MESA_pack_invert; OSMesa supplies both.
+ * The context for a guest context id, created on first use. The first one
+ * created is the share root, and every later one shares with it.
  */
-static bool is1gl_gl_init(Is1glState *s)
+static Is1glHostCtx *is1gl_host_ctx(Is1glState *s, uint32_t id)
 {
-    if (s->gl_ready) {
-        return true;
-    }
-    if (s->gl_failed) {
-        return false;
-    }
-    s->gl_failed = true;    /* cleared on success; never retried in a loop */
+    Is1glHostCtx *c;
+    OSMesaContext osm;
 
-    if (!is1gl_ctx_create(s)) {
-        return false;
+    c = g_hash_table_lookup(s->host_ctxs, GUINT_TO_POINTER(id));
+    if (c || s->gl_failed) {
+        return c;
     }
-#ifdef _WIN32
-    if (!is1gl_load_gl_extensions()) {
-        return false;
+    osm = is1gl_osmesa_create(s->share_root);
+    if (!osm) {
+        /* Never retried: a failure here would repeat on every record. */
+        error_report("is1gl: cannot create an OSMesa context");
+        s->gl_failed = true;
+        return NULL;
     }
-#endif
-    s->gl_ready = true;
-    s->gl_failed = false;
-
-    trace_is1gl_gl_up((const char *)glGetString(GL_RENDERER),
-                      (const char *)glGetString(GL_VERSION));
-    return true;
+    if (!s->share_root) {
+        s->share_root = osm;
+    }
+    c = g_new0(Is1glHostCtx, 1);
+    c->id = id;
+    c->ctx = osm;
+    g_hash_table_insert(s->host_ctxs, GUINT_TO_POINTER(id), c);
+    return c;
 }
 
-static Is1glGuestContext *is1gl_guest_context(Is1glState *s, uint32_t id)
+/*
+ * Drop every context, and with the last of them every texture and list.
+ * Done when the guest arms a new ring - a restarted renderd, whose
+ * predecessor's objects and state would otherwise still be here, under the
+ * same names its successor is about to hand out again. Render thread only.
+ */
+static void is1gl_destroy_contexts(Is1glState *s)
 {
-    Is1glGuestContext *ctx;
+    GHashTableIter it;
+    gpointer v;
 
-    ctx = g_hash_table_lookup(s->guest_contexts, GUINT_TO_POINTER(id));
-    if (!ctx) {
-        ctx = g_new0(Is1glGuestContext, 1);
-        ctx->id = id;
-        g_hash_table_insert(s->guest_contexts, GUINT_TO_POINTER(id), ctx);
+    if (s->cur) {
+        is1gl_drain_errors(s);
+        /* Newer OSMesa releases on NULL; older ones refuse, and destroying
+         * the current context releases it anyway. */
+        OSMesaMakeCurrent(NULL, NULL, 0, 0, 0);
+        s->cur = NULL;
     }
-    return ctx;
+    /* The share root last, although Mesa refcounts the shared state. */
+    g_hash_table_iter_init(&it, s->host_ctxs);
+    while (g_hash_table_iter_next(&it, NULL, &v)) {
+        Is1glHostCtx *c = v;
+
+        if (c->ctx != s->share_root) {
+            OSMesaDestroyContext(c->ctx);
+        }
+    }
+    if (s->share_root) {
+        OSMesaDestroyContext(s->share_root);
+        s->share_root = NULL;
+    }
+    g_hash_table_remove_all(s->host_ctxs);
+    s->colour_rb = 0;
+    s->draw_w = s->draw_h = 0;
 }
 
-static void is1gl_contexts_reset(Is1glState *s)
+/*
+ * The drawable is an FBO, because nothing is ever presented: the finished
+ * frame leaves through glReadPixels into the card's own memory. Its colour
+ * renderbuffer is shared by every context, and each context has an FBO of
+ * its own on it. Called with c current.
+ */
+static void is1gl_set_drawable(Is1glState *s, Is1glHostCtx *c,
+                               uint32_t w, uint32_t h)
 {
-    g_hash_table_remove_all(s->guest_contexts);
-    s->guest_ctx = 0;
-    s->context_switches = 0;
-    memset(s->current_viewport, 0, sizeof(s->current_viewport));
-}
+    bool resized = false;
 
-/* The drawable is an FBO, because nothing is ever presented: the finished
- * frame leaves through glReadPixels into the card's own memory. */
-static void is1gl_set_drawable(Is1glState *s, uint32_t w, uint32_t h)
-{
-    if (!is1gl_gl_init(s) || !w || !h || w > 4096 || h > 4096) {
-        return;
-    }
-    if (s->fbo && s->draw_w == w && s->draw_h == h) {
-        return;
-    }
-    /* Keep the default framebuffer the same size as the drawable. Nothing
-     * renders to it, but a mismatch would be a trap for anything that did. */
-    if ((w != s->osmesa_w || h != s->osmesa_h) &&
-        !is1gl_osmesa_current(s, w, h)) {
-        return;
-    }
-    if (!s->fbo) {
-        glGenFramebuffers(1, &s->fbo);
+    if (!s->colour_rb) {
         glGenRenderbuffers(1, &s->colour_rb);
     }
-    glBindRenderbuffer(GL_RENDERBUFFER, s->colour_rb);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, w, h);
-    glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                              GL_RENDERBUFFER, s->colour_rb);
+    if (s->draw_w != w || s->draw_h != h) {
+        glBindRenderbuffer(GL_RENDERBUFFER, s->colour_rb);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, w, h);
+        s->draw_w = w;
+        s->draw_h = h;
+        resized = true;
+    }
+    if (!c->fbo) {
+        glGenFramebuffers(1, &c->fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                  GL_RENDERBUFFER, s->colour_rb);
+    } else if (!resized) {
+        return;
+    }
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         error_report("is1gl: framebuffer incomplete at %ux%u", w, h);
+        return;
+    }
+    if (!resized) {
         return;
     }
 
@@ -500,41 +532,111 @@ static void is1gl_set_drawable(Is1glState *s, uint32_t w, uint32_t h)
             glEnable(GL_SCISSOR_TEST);
         }
     }
-    s->draw_w = w;
-    s->draw_h = h;
     trace_is1gl_drawable(w, h);
 }
 
 /*
- * MAKE_CURRENT carries a guest context id even though the original replay
- * path used only its drawable dimensions.  Restore the state that GL keeps
- * per context.  This also fixes older guest shims already installed in disk
- * images; newer shims emit the same restoration explicitly.
+ * MAKE_CURRENT: replay what follows in guest context `id`'s host context,
+ * bound to a drawable of w x h.
+ *
+ * A current guest library sends one whenever the next call comes from the
+ * other context. An older one sent one per context, when each thread first
+ * made its context current, so everything after the second landed in one
+ * host context - which is how this device used to behave anyway.
  */
 static void is1gl_make_current(Is1glState *s, uint32_t id,
                                uint32_t w, uint32_t h)
 {
-    Is1glGuestContext *ctx;
+    bool first = !s->share_root;
+    Is1glHostCtx *c;
 
-    is1gl_set_drawable(s, w, h);
-    if (!s->gl_ready) {
+    if (!w || !h || w > 4096 || h > 4096) {
         return;
     }
-
-    ctx = is1gl_guest_context(s, id);
-    if (!ctx->viewport_valid) {
-        ctx->viewport[0] = 0;
-        ctx->viewport[1] = 0;
-        ctx->viewport[2] = w;
-        ctx->viewport[3] = h;
-        ctx->viewport_valid = true;
+    c = is1gl_host_ctx(s, id);
+    if (!c) {
+        return;
     }
+    if (s->cur && s->cur != c) {
+        is1gl_drain_errors(s);
+    }
+
+    if (w != s->osmesa_w || h != s->osmesa_h) {
+        size_t need = (size_t)w * h * 4;
+
+        /*
+         * OSMesa keeps one buffer record per pixel format for every context,
+         * pointing at whatever it was last given, so the old allocation
+         * must outlive the next OSMesaMakeCurrent. Grow only.
+         */
+        if (need > s->osmesa_buf_sz) {
+            void *old = s->osmesa_buf;
+
+            s->osmesa_buf = g_malloc0(need);
+            s->osmesa_buf_sz = need;
+            if (!OSMesaMakeCurrent(c->ctx, s->osmesa_buf, GL_UNSIGNED_BYTE,
+                                   w, h)) {
+                error_report("is1gl: OSMesaMakeCurrent failed");
+                s->cur = NULL;
+                g_free(old);
+                return;
+            }
+            g_free(old);
+            c->buf = s->osmesa_buf;
+            c->buf_w = w;
+            c->buf_h = h;
+            s->cur = c;
+        }
+        s->osmesa_w = w;
+        s->osmesa_h = h;
+    }
+    if (s->cur != c || c->buf != s->osmesa_buf ||
+        c->buf_w != w || c->buf_h != h) {
+        if (!OSMesaMakeCurrent(c->ctx, s->osmesa_buf, GL_UNSIGNED_BYTE,
+                               w, h)) {
+            error_report("is1gl: OSMesaMakeCurrent failed");
+            s->cur = NULL;
+            return;
+        }
+        c->buf = s->osmesa_buf;
+        c->buf_w = w;
+        c->buf_h = h;
+        s->cur = c;
+    }
+
+    if (first) {
+#ifdef _WIN32
+        if (!is1gl_load_gl_extensions()) {
+            s->gl_failed = true;
+            s->cur = NULL;
+            return;
+        }
+#endif
+        /*
+         * Phase 0d confirmed the host offers 4.3 Compatibility and
+         * GL_MESA_pack_invert; OSMesa supplies both.
+         */
+        trace_is1gl_gl_up((const char *)glGetString(GL_RENDERER),
+                          (const char *)glGetString(GL_VERSION));
+    }
+    if (!c->fbo) {
+        /* GL starts a context's viewport at its first drawable. */
+        c->viewport[0] = 0;
+        c->viewport[1] = 0;
+        c->viewport[2] = w;
+        c->viewport[3] = h;
+    }
+    is1gl_set_drawable(s, c, w, h);
     s->guest_ctx = id;
     s->context_switches++;
-    memcpy(s->current_viewport, ctx->viewport,
-           sizeof(s->current_viewport));
-    glViewport(ctx->viewport[0], ctx->viewport[1],
-               ctx->viewport[2], ctx->viewport[3]);
+}
+
+static void is1gl_contexts_reset(Is1glState *s)
+{
+    /* The contexts themselves belong to the render thread; it drops them. */
+    s->gl_reset = true;
+    s->guest_ctx = 0;
+    s->context_switches = 0;
 }
 
 /* ------------------------------------------------------------ host hooks */
@@ -542,20 +644,12 @@ static void is1gl_make_current(Is1glState *s, uint32_t id,
 static void is1gl_host_glViewport(Is1glState *s, int32_t x, int32_t y,
                                   int32_t width, int32_t height)
 {
-    Is1glGuestContext *ctx;
-
-    if (s->guest_ctx) {
-        ctx = is1gl_guest_context(s, s->guest_ctx);
-        ctx->viewport[0] = x;
-        ctx->viewport[1] = y;
-        ctx->viewport[2] = width;
-        ctx->viewport[3] = height;
-        ctx->viewport_valid = true;
+    if (s->cur) {
+        s->cur->viewport[0] = x;
+        s->cur->viewport[1] = y;
+        s->cur->viewport[2] = width;
+        s->cur->viewport[3] = height;
     }
-    s->current_viewport[0] = x;
-    s->current_viewport[1] = y;
-    s->current_viewport[2] = width;
-    s->current_viewport[3] = height;
     glViewport(x, y, width, height);
 }
 
@@ -794,7 +888,7 @@ static void is1gl_readpixels(Is1glState *s, const uint8_t *a, uint32_t alen)
     uint8_t *dst;
     long bpp;
 
-    if (alen < 36 || !s->gl_ready) {
+    if (alen < 36 || !s->cur) {
         return;
     }
     x = get_i32(a + 0);
@@ -938,7 +1032,7 @@ static void is1gl_consume(Is1glState *s, uint32_t head)
             is1gl_readpixels(s, data + tail + 8, length - 8);
             break;
         default:
-            if (!s->gl_ready ||
+            if (!s->cur ||
                 !is1gl_replay_one(s, opcode, data + tail + 8, length - 8)) {
                 s->unknown_ops++;
                 if (s->unknown_ops <= 16) {
@@ -994,14 +1088,8 @@ tex_logged: ;
      * thousands of synchronous queries a frame; per batch it still names the
      * frame an error appeared in.
      */
-    if (s->gl_ready) {
-        GLenum e;
-        while ((e = glGetError()) != GL_NO_ERROR) {
-            s->gl_errors++;
-            if (s->gl_errors <= 16) {
-                trace_is1gl_gl_error(e, s->frames);
-            }
-        }
+    if (s->cur) {
+        is1gl_drain_errors(s);
     }
 
     /*
@@ -1021,14 +1109,21 @@ static void *is1gl_render_thread(void *opaque)
     qemu_mutex_lock(&s->lock);
     while (!s->stopping) {
         uint32_t head;
+        bool reset;
 
         if (!s->ring || s->head == s->tail) {
             qemu_cond_wait(&s->cond, &s->lock);
             continue;
         }
         head = s->head;
+        reset = s->gl_reset;
+        s->gl_reset = false;
         s->replaying = true;
         qemu_mutex_unlock(&s->lock);
+
+        if (reset) {
+            is1gl_destroy_contexts(s);
+        }
 
         /*
          * Records were written before the doorbell, and the doorbell is a VM
@@ -1333,7 +1428,7 @@ static void is1gl_realize(DeviceState *dev, Error **errp)
 
     qemu_mutex_init(&s->lock);
     qemu_cond_init(&s->cond);
-    s->guest_contexts = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+    s->host_ctxs = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                                NULL, g_free);
 
     /*
@@ -1389,7 +1484,11 @@ static void is1gl_unrealize(DeviceState *dev)
         fclose(s->frame_log_f);
         s->frame_log_f = NULL;
     }
-    g_clear_pointer(&s->guest_contexts, g_hash_table_destroy);
+    /*
+     * The OSMesa contexts are current on a thread that no longer exists and
+     * go with the process; only the bookkeeping is freed here.
+     */
+    g_clear_pointer(&s->host_ctxs, g_hash_table_destroy);
     qemu_cond_destroy(&s->cond);
     qemu_mutex_destroy(&s->lock);
 }
@@ -1439,15 +1538,25 @@ void hmp_info_is1gl(Monitor *mon, const QDict *qdict)
                    "  wraps %" PRIu64 "\n", s->records, s->fences, s->wraps);
     monitor_printf(mon, "gl         %s  drawable %ux%u  frames %" PRIu64
                    "  readbacks %" PRIu64 "\n",
-                   s->gl_ready ? (const char *)"up"
-                               : (s->gl_failed ? "FAILED" : "not started"),
+                   s->gl_failed ? "FAILED"
+                                : (s->share_root ? "up" : "not started"),
                    s->draw_w, s->draw_h, s->frames, s->readbacks);
-    monitor_printf(mon, "contexts   %u known  current %u  switches %" PRIu64
-                   "\n", g_hash_table_size(s->guest_contexts), s->guest_ctx,
+    /*
+     * Read from the monitor while the render thread may be switching, as
+     * the counters above are; good enough for a debugging aid.
+     */
+    monitor_printf(mon, "contexts   %u host  current %u  switches %" PRIu64
+                   "\n", g_hash_table_size(s->host_ctxs), s->guest_ctx,
                    s->context_switches);
-    monitor_printf(mon, "viewport   %d,%d %dx%d\n",
-                   s->current_viewport[0], s->current_viewport[1],
-                   s->current_viewport[2], s->current_viewport[3]);
+    {
+        Is1glHostCtx *c = qatomic_read(&s->cur);
+
+        if (c) {
+            monitor_printf(mon, "viewport   %d,%d %dx%d\n",
+                           c->viewport[0], c->viewport[1],
+                           c->viewport[2], c->viewport[3]);
+        }
+    }
     if (s->frames) {
         static const char *labels[8] = {
             "   <5ms", " 5-10ms", "10-17ms", "17-25ms",
