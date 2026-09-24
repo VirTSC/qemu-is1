@@ -64,14 +64,22 @@ static void *access_ptr(X86Access *ac, vaddr addr, unsigned len)
         return NULL;
     }
 
+    /*
+     * Compare as offset + len, not offset <= size1 - len: size1 and len are
+     * unsigned, so when fewer than len bytes of the block are on the first
+     * page (an fnsave starting 4 bytes before a page boundary, say) the
+     * subtraction wraps, every access passes, and the part meant for the
+     * second page is written through haddr1 into whatever guest-physical
+     * page happens to follow the first one.
+     */
 #ifdef CONFIG_USER_ONLY
-    assert(offset <= ac->size1 - len);
+    assert(offset + len <= ac->size1);
     return ac->haddr1 + offset;
 #else
-    if (likely(offset <= ac->size1 - len)) {
+    if (likely(offset + len <= ac->size1)) {
         return ac->haddr1 + offset;
     }
-    assert(offset <= ac->size - len);
+    assert(offset + len <= ac->size);
     /*
      * If the address is not naturally aligned, it might span both pages.
      * Only return ac->haddr2 if the area is entirely within the second page,
