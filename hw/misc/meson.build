@@ -44,6 +44,8 @@ subdir('macio')
 # unconditionally: this is a purpose-built fork, and gating it behind Kconfig
 # would add moving parts for no benefit.
 system_ss.add(files('thunderstorm.c'))
+# Host wall clock for the IS1 guest's clock-sync daemon (virtsc src/is1clock).
+system_ss.add(files('is1clock.c'))
 # is1gl needs OSMesa for its host GL context - see the comment at the top of
 # is1gl.c. Without it the device still exists but reports that it was built
 # without GL.
