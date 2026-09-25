@@ -548,6 +548,8 @@ static void is1gl_make_current(Is1glState *s, uint32_t id,
                                uint32_t w, uint32_t h)
 {
     bool first = !s->share_root;
+    bool inherit_projection = false;
+    GLdouble projection[16];
     Is1glHostCtx *c;
 
     if (!w || !h || w > 4096 || h > 4096) {
@@ -559,6 +561,25 @@ static void is1gl_make_current(Is1glState *s, uint32_t id,
     }
     if (s->cur && s->cur != c) {
         is1gl_drain_errors(s);
+        /*
+         * renderd initializes its window projection in the first context,
+         * then renders in a second context sharing that same drawable. The
+         * old single-host-context replay happened to carry the projection
+         * across. Keep that one-time startup behavior while leaving texture
+         * bindings, enables, stacks, and all subsequent state per context.
+         */
+        if (!c->fbo && s->cur->ctx == s->share_root &&
+            s->draw_w == w && s->draw_h == h) {
+            int i;
+
+            glGetDoublev(GL_PROJECTION_MATRIX, projection);
+            for (i = 0; i < 16; i++) {
+                if (projection[i] != (i % 5 == 0 ? 1.0 : 0.0)) {
+                    inherit_projection = true;
+                    break;
+                }
+            }
+        }
     }
 
     if (w != s->osmesa_w || h != s->osmesa_h) {
@@ -627,6 +648,14 @@ static void is1gl_make_current(Is1glState *s, uint32_t id,
         c->viewport[3] = h;
     }
     is1gl_set_drawable(s, c, w, h);
+    if (inherit_projection) {
+        GLint matrix_mode;
+
+        glGetIntegerv(GL_MATRIX_MODE, &matrix_mode);
+        glMatrixMode(GL_PROJECTION);
+        glLoadMatrixd(projection);
+        glMatrixMode(matrix_mode);
+    }
     s->guest_ctx = id;
     s->context_switches++;
 }
