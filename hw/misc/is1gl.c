@@ -47,6 +47,10 @@
 #include "qom/object.h"
 #include "trace.h"
 
+#ifdef CONFIG_PNG
+#include <png.h>
+#endif
+
 /*
  * Host GL comes from OSMesa: off-screen software rendering with no window
  * system behind it, and a genuine compatibility profile, which is what this
@@ -139,6 +143,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Is1glState, IS1GL)
 #define IS1GL_REG_APER_LO  0x24   /* rw  AGP aperture base                 */
 #define IS1GL_REG_APER_HI  0x28   /* rw  */
 #define IS1GL_REG_APER_SZ  0x2c   /* rw  writing it maps the aperture      */
+#define IS1GL_REG_CAPS     0x30   /* ro  optional operations              */
+#define IS1GL_CAP_QT_PNG   0x01
 #define IS1GL_REG_SIZE     0x1000
 
 /* I/O port window. Root-only in the guest (Phase 0a) - test use only. */
@@ -270,6 +276,7 @@ struct Is1glState {
     uint64_t records, fences, wraps, unknown_ops, bad_records;
     uint64_t frames, readbacks, gl_errors;
     uint64_t replay_ns, readback_ns;
+    uint64_t qt_png_decodes, qt_png_failures, qt_png_decode_ns;
 
     /*
      * Per-frame cost, and specifically its tail.
@@ -908,6 +915,63 @@ static uint8_t *is1gl_map_dst(Is1glState *s, uint64_t phys, uint64_t len)
     return s->aper_ptr + off;
 }
 
+/* Decode one PNG-compressed QuickTime frame into a guest AGP scratch buffer.
+ * The first four destination bytes are a completion status (1 = success).
+ * The guest waits for the following FENCE before reading either status or
+ * RGBA pixels. Keeping this outside the vCPU thread lets it continue running
+ * while the host does the PNG work. */
+static void is1gl_qt_png_decode(Is1glState *s, const uint8_t *a, uint32_t alen)
+{
+    uint32_t w, h, phys, png_len;
+    uint64_t output_len;
+    uint8_t *dst;
+    int64_t start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    bool ok = false;
+
+    if (alen < 16) {
+        s->bad_records++;
+        return;
+    }
+    w = ldl_le_p(a);
+    h = ldl_le_p(a + 4);
+    phys = ldl_le_p(a + 8);
+    png_len = ldl_le_p(a + 12);
+    if (!w || !h || w > 2048 || h > 2048 || png_len > 2 * 1024 * 1024 ||
+        png_len > alen - 16) {
+        s->qt_png_failures++;
+        return;
+    }
+    output_len = 4 + (uint64_t)w * h * 4;
+    dst = is1gl_map_dst(s, phys, output_len);
+    if (!dst) {
+        s->qt_png_failures++;
+        return;
+    }
+    stl_le_p(dst, 0);
+#ifdef CONFIG_PNG
+    {
+        png_image image = { 0 };
+
+        image.version = PNG_IMAGE_VERSION;
+        if (png_image_begin_read_from_memory(&image, a + 16, png_len)) {
+            if (image.width == w && image.height == h) {
+                image.format = PNG_FORMAT_RGBA;
+                ok = png_image_finish_read(&image, NULL, dst + 4,
+                                           w * 4, NULL);
+            }
+            png_image_free(&image);
+        }
+    }
+#endif
+    if (ok) {
+        stl_le_p(dst, 1);
+        s->qt_png_decodes++;
+        s->qt_png_decode_ns += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
+    } else {
+        s->qt_png_failures++;
+    }
+}
+
 static void is1gl_readpixels(Is1glState *s, const uint8_t *a, uint32_t alen)
 {
     int32_t x, y, w, h, row_length, invert;
@@ -1059,6 +1123,9 @@ static void is1gl_consume(Is1glState *s, uint32_t head)
         }
         case IS1GL_OP_READPIXELS:
             is1gl_readpixels(s, data + tail + 8, length - 8);
+            break;
+        case IS1GL_OP_QT_PNG_DECODE:
+            is1gl_qt_png_decode(s, data + tail + 8, length - 8);
             break;
         default:
             if (!s->cur ||
@@ -1308,6 +1375,13 @@ static uint64_t is1gl_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case IS1GL_REG_APER_LO:  val = (uint32_t)s->aper_base; break;
     case IS1GL_REG_APER_HI:  val = (uint32_t)(s->aper_base >> 32); break;
     case IS1GL_REG_APER_SZ:  val = (uint32_t)s->aper_size; break;
+    case IS1GL_REG_CAPS:
+#ifdef CONFIG_PNG
+        val = IS1GL_CAP_QT_PNG;
+#else
+        val = 0;
+#endif
+        break;
     default:                 val = 0; break;
     }
     trace_is1gl_mmio_read(addr, val, size);
@@ -1612,6 +1686,11 @@ void hmp_info_is1gl(Monitor *mon, const QDict *qdict)
         monitor_printf(mon, "\n");
     }
     monitor_printf(mon, "gl errors  %" PRIu64 "\n", s->gl_errors);
+    monitor_printf(mon, "qt png     %" PRIu64 " decoded, %" PRIu64
+                   " failed, %.3f ms/decode\n", s->qt_png_decodes,
+                   s->qt_png_failures,
+                   s->qt_png_decodes ?
+                   s->qt_png_decode_ns / 1e6 / s->qt_png_decodes : 0.0);
     monitor_printf(mon, "done_seq   %u\n", s->done_seq);
     monitor_printf(mon, "errors     %" PRIu64 " unknown opcode, %" PRIu64
                    " malformed\n", s->unknown_ops, s->bad_records);

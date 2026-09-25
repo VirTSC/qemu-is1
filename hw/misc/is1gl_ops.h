@@ -55,8 +55,9 @@
 #define IS1GL_OP_glBindTexture            49
 #define IS1GL_OP_glTexSubImage2D          50
 #define IS1GL_OP_glCopyTexSubImage2D      51
+#define IS1GL_OP_QT_PNG_DECODE            52
 
-#define IS1GL_OP_COUNT 52
+#define IS1GL_OP_COUNT 53
 
 #define IS1GL_OP_NAMES_0 "NOP", "WRAP", "FENCE", "MAKE_CURRENT", "SWAP", "READPIXELS", "glClearColor", "glClear"
 #define IS1GL_OP_NAMES_1 "glBlendFunc", "glLineWidth", "glScissor", "glClipPlane", "glEnable", "glDisable", "glPushAttrib", "glPopAttrib"
@@ -64,7 +65,7 @@
 #define IS1GL_OP_NAMES_3 "glMultMatrixf", "glRotated", "glRotatef", "glScalef", "glTranslated", "glTranslatef", "glDeleteLists", "glNewList"
 #define IS1GL_OP_NAMES_4 "glEndList", "glCallList", "glBegin", "glEnd", "glVertex2d", "glVertex2f", "glColor4f", "glTexCoord2f"
 #define IS1GL_OP_NAMES_5 "glPixelStoref", "glPixelStorei", "glDrawPixels", "glTexEnvf", "glTexEnvi", "glTexParameterf", "glTexParameteri", "glTexImage2D"
-#define IS1GL_OP_NAMES_6 "glDeleteTextures", "glBindTexture", "glTexSubImage2D", "glCopyTexSubImage2D"
+#define IS1GL_OP_NAMES_6 "glDeleteTextures", "glBindTexture", "glTexSubImage2D", "glCopyTexSubImage2D", "QT_PNG_DECODE"
 #define IS1GL_OP_NAMES { IS1GL_OP_NAMES_0, IS1GL_OP_NAMES_1, IS1GL_OP_NAMES_2, IS1GL_OP_NAMES_3, IS1GL_OP_NAMES_4, IS1GL_OP_NAMES_5, IS1GL_OP_NAMES_6 }
 
 #endif
